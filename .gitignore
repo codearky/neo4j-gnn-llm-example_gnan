@@ -3,3 +3,9 @@ scratch/
 .idea/
 .ipynb_checkpoints/
 
+stark_qa_v0_0_orig/*
+__pycache__/*
+.vscode/*
+db.env
+*.pt
+

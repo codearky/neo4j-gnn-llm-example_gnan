@@ -1,4 +1,5 @@
 import os
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -91,6 +92,7 @@ class STaRKQADataset(InMemoryDataset):
         algo_config_version: int,
         split: str = "train",
         force_reload: bool = False,
+        transform: Optional[Callable] = None,
     ) -> None:
         self.split = split
         self.raw_dataset = raw_dataset
@@ -98,7 +100,7 @@ class STaRKQADataset(InMemoryDataset):
         self.algo_config_version = algo_config_version
         self.query_embedding_dict = torch.load(os.path.join(os.path.dirname(__file__), 'data-loading/emb/prime/text-embedding-ada-002/query/query_emb_dict.pt')) # load from parent directory of this file
 
-        super().__init__(root, force_reload=force_reload)
+        super().__init__(root, force_reload=force_reload, transform=transform)
 
         path = self.processed_paths[0]
         self.load(path)
