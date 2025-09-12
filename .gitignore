@@ -5,7 +5,6 @@ scratch/
 
 __pycache__/
 .vscode/
-data-loading/
 gnan_stark_qa_v0_0/
 other_stark_qa_v0_0/
 stark_qa_v0_0_orig/
