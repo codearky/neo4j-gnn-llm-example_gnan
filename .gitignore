@@ -4,7 +4,6 @@ scratch/
 .ipynb_checkpoints/
 
 __pycache__/
-.vscode/
 gnan_stark_qa_v0_0/
 other_stark_qa_v0_0/
 stark_qa_v0_0_orig/
