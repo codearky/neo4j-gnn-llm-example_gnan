@@ -383,6 +383,10 @@ def train(
             }
             eval_output.append(eval_data)
         progress_bar_test.update(1)
+    
+    save_params_dict(model, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}.pt')
+    torch.save(eval_output, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_eval_outs.pt')
+    compute_metrics(eval_output)
 
     # Permuted-topk evaluation for GNAN models
     if num_gnn_layers > 0:
@@ -391,8 +395,7 @@ def train(
         compute_metrics(permuted_eval_output)
 
     print(f"Total Training Time: {time.time() - start_time:2f}s")
-    save_params_dict(model, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}.pt')
-    torch.save(eval_output, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_eval_outs.pt')
+
     if num_gnn_layers > 0:
         torch.save(permuted_eval_output, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_perm_top10_eval_outs.pt')
 

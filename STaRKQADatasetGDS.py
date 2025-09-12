@@ -157,27 +157,33 @@ class STaRKQADataset(InMemoryDataset):
 
         with open(f"configs/algo_config_v{self.algo_config_version}.yaml", "r") as f:
             pcst_config = yaml.safe_load(f)
+        skip_pcst = pcst_config.get('skip_pcst', False)
 
         all_pcst_nodes = {} # for metrics only
         for index, (question_id, prompt, _) in tqdm(dataframe.iterrows()):
             query_emb = self.query_embedding_dict[question_id].numpy()[0]
             nodes_df, relationships_df = base_subgraph[index]
 
-            with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
-                topn_nodes = get_nodes_by_vector_search(query_emb, pcst_config["prized_nodes"], driver)
-                topk_nodes = get_nodes_by_vector_search(query_emb, pcst_config["topk_nodes"], driver) # for union
+            if not skip_pcst:
+                with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
+                    topn_nodes = get_nodes_by_vector_search(query_emb, pcst_config["prized_nodes"], driver)
+                    topk_nodes = get_nodes_by_vector_search(query_emb, pcst_config["topk_nodes"], driver) # for union
 
-            assign_node_prizes(nodes_df, topn_nodes) #adds column 'nodePrizes'
-            assign_edge_costs(relationships_df) #adds column 'edgeCosts'
+                assign_node_prizes(nodes_df, topn_nodes) #adds column 'nodePrizes'
+                assign_edge_costs(relationships_df) #adds column 'edgeCosts'
 
-            # Run the pcst algorithm
-            gds = GraphDataScience(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
-            with gds.graph.construct(graph_name='pcst-graph', nodes=nodes_df, relationships=relationships_df.drop(['sourceNodeType','targetNodeType'], axis=1), undirected_relationship_types=['*']) as G:
-                pcst_output = gds.prizeSteinerTree.stream(G, prizeProperty='nodePrize', relationshipWeightProperty='edgeCost')
-            pcst_nodes, pcst_edges = convert_pcst_output(pcst_output)
+                # Run the pcst algorithm
+                gds = GraphDataScience(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+                with gds.graph.construct(graph_name='pcst-graph', nodes=nodes_df, relationships=relationships_df.drop(['sourceNodeType','targetNodeType'], axis=1), undirected_relationship_types=['*']) as G:
+                    pcst_output = gds.prizeSteinerTree.stream(G, prizeProperty='nodePrize', relationshipWeightProperty='edgeCost')
+                pcst_nodes, pcst_edges = convert_pcst_output(pcst_output)
 
-            # Take union with top25
-            pcst_nodes = np.unique(np.concatenate((pcst_nodes, topk_nodes)))
+                # Take union with top25
+                pcst_nodes = np.unique(np.concatenate((pcst_nodes, topk_nodes)))
+            else:
+                # Skip PCST: use the base subgraph directly
+                pcst_nodes = nodes_df['nodeId'].values
+                pcst_edges = np.stack((relationships_df['sourceNodeId'].values, relationships_df['targetNodeId'].values), axis=1) if len(relationships_df) > 0 else np.empty((0, 2), dtype=int)
 
             # Retrieve node embedding, label and textual graph description
             with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
@@ -194,7 +200,7 @@ class STaRKQADataset(InMemoryDataset):
             desc = textualize_graph(textual_nodes_df, textual_edges_df)
             node_embedding = torch.tensor(textual_nodes_df['textEmbedding'].tolist())
             consecutive_map = {id : i for i, id in enumerate(textual_nodes_df['node_id'].values)}
-            edge_index = torch.tensor([(consecutive_map[src], consecutive_map[tgt]) for src, tgt in pcst_edges], dtype=torch.int32).T #when dtype is not specified, it becomes a float tensor when unserialized, weird.
+            edge_index = torch.tensor([(consecutive_map[src], consecutive_map[tgt]) for src, tgt in pcst_edges], dtype=torch.int32).T if len(pcst_edges) > 0 else torch.empty((2,0), dtype=torch.int32)
             enriched_data = Data(
                 x=node_embedding,
                 edge_index=edge_index,
