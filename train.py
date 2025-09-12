@@ -73,7 +73,7 @@ def print_node_importance_examples(model, test_dataset, print_node_description: 
         data_i = data_i.to(model.llm.device)
         with torch.no_grad():
             contrib = model.gnn.node_importance(data_i)
-            scores = contrib.sum(dim=1)
+            scores = contrib.sum(dim=1) 
             topk = min(10, scores.numel())
             top_vals, top_idx = torch.topk(scores, k=topk)
 
@@ -259,7 +259,7 @@ def train(
         hidden_channels=hidden_channels,
         out_channels=1536,
         n_layers=num_gnn_layers,
-        normalize_rho=False,
+        normalize_rho=True,
         feature_groups=[list(range(1536))],
     )
 
