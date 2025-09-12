@@ -3,10 +3,12 @@ scratch/
 .idea/
 .ipynb_checkpoints/
 
-stark_qa_v0_0_orig/*
-__pycache__/*
-.vscode/*
-db.env
-*.pt
-
+__pycache__/
+.vscode/
 data-loading/
+gnan_stark_qa_v0_0/
+other_stark_qa_v0_0/
+stark_qa_v0_0_orig/
+stark_qa_v0_0/
+
+base_subgraphs/
