@@ -180,6 +180,37 @@ def evaluate_with_permuted_topk_node_features(model, test_dataset, topk: int = 3
     return eval_output
 
 
+def build_induced_subgraph_desc(full_desc: str, node_index_set: set[int]) -> str:
+    sep = '\nsrc,edge_attr,dst\n'
+    pos = full_desc.find(sep)
+    nodes_csv = full_desc[:pos] if pos != -1 else full_desc
+    edges_csv = full_desc[pos:] if pos != -1 else ''
+
+    try:
+        nodes_df = pd.read_csv(io.StringIO(nodes_csv))
+    except Exception:
+        return full_desc
+
+    # Filter nodes by row index membership
+    if len(node_index_set) > 0:
+        keep_indices = sorted(list(node_index_set))
+        nodes_df = nodes_df.iloc[keep_indices]
+
+    nodes_str = nodes_df.to_csv(index=False)
+
+    if pos == -1 or edges_csv.strip() == '':
+        return nodes_str
+
+    try:
+        edges_df = pd.read_csv(io.StringIO(edges_csv))
+        if 'src' in edges_df.columns and 'dst' in edges_df.columns:
+            edges_df = edges_df[edges_df['src'].isin(nodes_df['node_id'].to_list()) & edges_df['dst'].isin(nodes_df['node_id'].to_list())]
+        edges_str = edges_df.to_csv(index=False)
+        return nodes_str + sep + edges_str
+    except Exception:
+        return nodes_str
+
+
 def train(
     num_epochs,
     hidden_channels,
@@ -196,6 +227,8 @@ def train(
     num_gpus=None,
     print_node_description: bool = False,
     load_model_path: str | None = None,
+    eval_topk_nodes: int | None = None,
+    eval_llm_only: bool = False,
 ):
     def adjust_learning_rate(param_group, LR, epoch):
         # Decay the learning rate with half-cycle cosine after warmup
@@ -369,27 +402,86 @@ def train(
     model.eval()
     eval_output = []
     print("Final evaluation...")
-    progress_bar_test = tqdm(range(len(test_loader)))
-    for step, batch in enumerate(test_loader):
-        with torch.no_grad():
-            pred_time = time.time()
-            pred = inference_step(model, batch, model_save_name)
-            print(f"Time to predict: {time.time() - pred_time:2f}s")
-            eval_data = {
-                'pred': pred,
-                'question': batch.question,
-                'desc': batch.desc,
-                'label': batch.label
-            }
-            eval_output.append(eval_data)
-        progress_bar_test.update(1)
+
+    # If requested, restrict LLM context to induced subgraph over top-k important nodes,
+    # and/or bypass GNN by using only the LLM for generation.
+    use_topk_filtering = (num_gnn_layers > 0) and (eval_topk_nodes is not None) and (eval_topk_nodes > 0)
+    if use_topk_filtering or eval_llm_only:
+        progress_bar_test = tqdm(range(len(test_dataset)))
+        model_device = llm.device if hasattr(llm, 'device') else next(model.parameters()).device
+        for idx in range(len(test_dataset)):
+            data_i = test_dataset[idx]
+            data_i = data_i.to(model_device)
+
+            # Prepare question and original description
+            q_list = [data_i.question if isinstance(data_i.question, str) else (data_i.question[0] if len(data_i.question) > 0 else '')]
+            orig_desc = data_i.desc if isinstance(data_i.desc, str) else (data_i.desc[0] if len(data_i.desc) > 0 else '')
+
+            # Compute top-k node set if needed
+            if use_topk_filtering:
+                with torch.no_grad():
+                    contrib = model.gnn.node_importance(data_i)
+                    scores = contrib.sum(dim=1)
+                    k = min(eval_topk_nodes, scores.numel())
+                    if k > 0:
+                        _, top_idx = torch.topk(scores, k=k)
+                        node_set = set(int(j) for j in top_idx.tolist())
+                    else:
+                        node_set = set()
+                desc_filtered = build_induced_subgraph_desc(orig_desc, node_set)
+            else:
+                desc_filtered = orig_desc
+
+            # Run inference
+            if eval_llm_only:
+                with torch.no_grad():
+                    pred_list = llm.inference(q_list, [desc_filtered])
+            else:
+                batch_vec = getattr(data_i, 'batch', None)
+                if batch_vec is None:
+                    batch_vec = torch.zeros(data_i.x.size(0), dtype=torch.long, device=data_i.x.device)
+                with torch.no_grad():
+                    pred_list = model.inference(
+                        data_i,
+                        q_list,
+                        data_i.x,
+                        data_i.edge_index,
+                        batch_vec,
+                        data_i.edge_attr,
+                        [desc_filtered],
+                    )
+
+            pred = pred_list[0] if isinstance(pred_list, (list, tuple)) and len(pred_list) > 0 else str(pred_list)
+            eval_output.append({
+                'pred': [pred],
+                'question': [q_list[0]],
+                'desc': [desc_filtered],
+                'label': [data_i.label if isinstance(data_i.label, str) else (data_i.label[0] if len(data_i.label) > 0 else '')],
+            })
+            progress_bar_test.update(1)
+    else:
+        progress_bar_test = tqdm(range(len(test_loader)))
+        for step, batch in enumerate(test_loader):
+            with torch.no_grad():
+                pred_time = time.time()
+                pred = inference_step(model, batch, model_save_name)
+                print(f"Time to predict: {time.time() - pred_time:2f}s")
+                eval_data = {
+                    'pred': pred,
+                    'question': batch.question,
+                    'desc': batch.desc,
+                    'label': batch.label
+                }
+                eval_output.append(eval_data)
+            progress_bar_test.update(1)
     
     save_params_dict(model, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}.pt')
     torch.save(eval_output, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_eval_outs.pt')
+    print("regular metrics:")
     compute_metrics(eval_output)
 
     # Permuted-topk evaluation for GNAN models
-    if num_gnn_layers > 0:
+    if num_gnn_layers > 0 and not eval_llm_only:
         permuted_eval_output = evaluate_with_permuted_topk_node_features(model, test_dataset, topk=10)
         print("\nPermuted-top-10 metrics:")
         compute_metrics(permuted_eval_output)
@@ -416,6 +508,8 @@ if __name__ == '__main__':
     parser.add_argument('--freeze_llm', type=bool, default=False)
     parser.add_argument('--print_node_description', action='store_true')
     parser.add_argument('--load_model_path', type=str, default=None)
+    parser.add_argument('--eval_topk_nodes', type=int, default=0)
+    parser.add_argument('--eval_llm_only', action='store_true')
     args = parser.parse_args()
     load_dotenv('db.env', override=True)
 
@@ -436,6 +530,8 @@ if __name__ == '__main__':
         num_gpus=1,
         print_node_description=args.print_node_description,
         load_model_path=args.load_model_path,
+        eval_topk_nodes=args.eval_topk_nodes,
+        eval_llm_only=args.eval_llm_only,
     )
     print(f"Total Time: {time.time() - start_time:2f}s")
 

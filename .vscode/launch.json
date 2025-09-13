@@ -2,7 +2,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Train STaRK QA - pyg_new",
+            "name": "Train",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/train.py",
@@ -29,7 +29,7 @@
             "stopOnEntry": false
         }, 
         {
-            "name": "Train STaRK QA - no pcst",
+            "name": "Train- no pcst",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/train.py",
@@ -56,7 +56,7 @@
             "stopOnEntry": false
         },
         {
-            "name": "Evaluate STaRK QA - pyg_new",
+            "name": "Evaluate",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/train.py",
@@ -70,6 +70,65 @@
                 "--eval_batch_size", "4",
                 "--num_gnn_layers", "4",
                 "--load_model_path", "/worxpace/neo4j-gnn-llm-example/stark_qa_v0_0/models/0_0_0_gnn-llm-llama3.1-8b_best_val_loss_ckpt.pt"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "CONDA_DEFAULT_ENV": "pyg_new",
+                "NEO4J_URI": "bolt://localhost:7687",
+                "NEO4J_USERNAME": "neo4j",
+                "NEO4J_PASSWORD": "password"
+            },
+            "python": "/home/me.docker/.conda/envs/pyg_new/bin/python",
+            "justMyCode": false,
+            "stopOnEntry": false
+        },
+        {
+            "name": "Evaluate- llm only",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "args": [
+                "--checkpointing",
+                "--llama_version", "llama3.1-8b",
+                // "--llama_version", "tiny_llama",
+                "--retrieval_config_version", "0",
+                "--algo_config_version", "0",
+                "--g_retriever_config_version", "0",
+                "--eval_batch_size", "4",
+                "--num_gnn_layers", "4",
+                "--load_model_path", "/worxpace/neo4j-gnn-llm-example/stark_qa_v0_0/models/0_0_0_gnn-llm-llama3.1-8b_best_val_loss_ckpt.pt",
+                "--eval_llm_only"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "CONDA_DEFAULT_ENV": "pyg_new",
+                "NEO4J_URI": "bolt://localhost:7687",
+                "NEO4J_USERNAME": "neo4j",
+                "NEO4J_PASSWORD": "password"
+            },
+            "python": "/home/me.docker/.conda/envs/pyg_new/bin/python",
+            "justMyCode": false,
+            "stopOnEntry": false
+        },
+        {
+            "name": "Evaluate- topk",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "args": [
+                "--checkpointing",
+                "--llama_version", "llama3.1-8b",
+                // "--llama_version", "tiny_llama",
+                "--retrieval_config_version", "0",
+                "--algo_config_version", "0",
+                "--g_retriever_config_version", "0",
+                "--eval_batch_size", "4",
+                "--num_gnn_layers", "4",
+                "--load_model_path", "/worxpace/neo4j-gnn-llm-example/stark_qa_v0_0/models/0_0_0_gnn-llm-llama3.1-8b_best_val_loss_ckpt.pt",
+                "--eval_llm_only",
+                "--eval_topk_nodes", "10"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
