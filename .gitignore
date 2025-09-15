@@ -12,3 +12,5 @@ stark_qa_v0_0_orig/
 stark_qa_v0_0/
 
 base_subgraphs/
+processed_chunks/
+*stark_qa*/
