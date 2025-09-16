@@ -83,13 +83,13 @@ def train(
         return lr
 
     start_time = time.time()
-    qa_dataset = load_qa("prime")
+    qa_dataset = load_qa("amazon")
     qa_raw_train = qa_dataset.get_subset('train')
     qa_raw_val = qa_dataset.get_subset('val')
     qa_raw_test = qa_dataset.get_subset('test')
     seed_everything(42)
 
-    print("Loading stark-qa prime train dataset...")
+    print("Loading stark-qa amazon train dataset...")
     t = time.time()
 
     if num_gnn_layers == 0:
@@ -104,9 +104,9 @@ def train(
         root_path = f"stark_qa_vector_rag_{retrieval_config_version}"
         train_dataset = STaRKQAVectorSearchDataset(root_path, qa_raw_train, split="train")
         print(f'Finished loading train dataset in {time.time() - t} seconds.')
-        print("Loading stark-qa prime val dataset...")
+        print("Loading stark-qa amazon val dataset...")
         val_dataset = STaRKQAVectorSearchDataset(root_path, qa_raw_val, split="val")
-        print("Loading stark-qa prime test dataset...")
+        print("Loading stark-qa amazon test dataset...")
         test_dataset = STaRKQAVectorSearchDataset(root_path, qa_raw_test, split="test")
         os.makedirs(f'{root_path}/models', exist_ok=True)
     else:
