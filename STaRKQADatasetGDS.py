@@ -98,7 +98,7 @@ class STaRKQADataset(InMemoryDataset):
         self.raw_dataset = raw_dataset
         self.retrieval_config_version = retrieval_config_version
         self.algo_config_version = algo_config_version
-        self.query_embedding_dict = torch.load(os.path.join(os.path.dirname(__file__), 'data-loading/emb/prime/text-embedding-ada-002/query/query_emb_dict.pt')) # load from parent directory of this file
+        self.query_embedding_dict = torch.load(os.path.join(os.path.dirname(__file__), 'data-loading/emb/amazon/text-embedding-ada-002/query/query_emb_dict.pt')) # load from parent directory of this file
 
         super().__init__(root, force_reload=force_reload, transform=transform)
 
