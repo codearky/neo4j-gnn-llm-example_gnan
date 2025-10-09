@@ -41,7 +41,7 @@ def get_textual_nodes(node_ids: list[int], driver: Driver) -> DataFrame:
     res = driver.execute_query("""
     UNWIND $nodeIds AS nodeId
     MATCH(node:_Entity_ {nodeId:nodeId})
-    RETURN node.nodeId AS nodeId, node.name AS name, node.details AS description, node.textEmbedding AS textEmbedding
+    RETURN node.nodeId AS nodeId, node.title AS name, node.details AS description, node.textEmbedding AS textEmbedding
     """,
                                parameters_={"nodeIds": node_ids})
     return pd.DataFrame([rec.data() for rec in res.records])
@@ -140,8 +140,13 @@ class STaRKQADataset(InMemoryDataset):
                     topk_node_ids = get_nodes_by_vector_search(query_emb, 25*cypher_config['k_nodes'], driver)[:cypher_config['k_nodes']]
                     relationships_df = cypher_retrieval(topk_node_ids, driver) # Variations of cypher queries are supported here
 
-                nodes = np.unique(np.concatenate((relationships_df['sourceNodeId'].values, relationships_df['targetNodeId'].values)))
-                nodes_df = pd.DataFrame({'nodeId': nodes})
+                expected_cols = ['sourceNodeId','targetNodeId','relationshipType','sourceNodeType','targetNodeType']
+                if (not isinstance(relationships_df, pd.DataFrame)) or relationships_df.empty or (not set(expected_cols).issubset(relationships_df.columns)):
+                    nodes_df = pd.DataFrame({'nodeId': topk_node_ids})
+                    relationships_df = pd.DataFrame(columns=expected_cols)
+                else:
+                    nodes = np.unique(np.concatenate((relationships_df['sourceNodeId'].values, relationships_df['targetNodeId'].values)))
+                    nodes_df = pd.DataFrame({'nodeId': nodes})
 
                 base_subgraph[index] = (nodes_df, relationships_df)
 
@@ -169,10 +174,14 @@ class STaRKQADataset(InMemoryDataset):
             assign_edge_costs(relationships_df) #adds column 'edgeCosts'
 
             # Run the pcst algorithm
-            gds = GraphDataScience(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
-            with gds.graph.construct(graph_name='pcst-graph', nodes=nodes_df, relationships=relationships_df.drop(['sourceNodeType','targetNodeType'], axis=1), undirected_relationship_types=['*']) as G:
-                pcst_output = gds.prizeSteinerTree.stream(G, prizeProperty='nodePrize', relationshipWeightProperty='edgeCost')
-            pcst_nodes, pcst_edges = convert_pcst_output(pcst_output)
+            if relationships_df.empty:
+                pcst_nodes = nodes_df['nodeId'].values
+                pcst_edges = np.empty((0, 2), dtype=int)
+            else:
+                gds = GraphDataScience(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+                with gds.graph.construct(graph_name='pcst-graph', nodes=nodes_df, relationships=relationships_df.drop(['sourceNodeType','targetNodeType'], axis=1), undirected_relationship_types=['*']) as G:
+                    pcst_output = gds.prizeSteinerTree.stream(G, prizeProperty='nodePrize', relationshipWeightProperty='edgeCost')
+                pcst_nodes, pcst_edges = convert_pcst_output(pcst_output)
 
             # Take union with top25
             pcst_nodes = np.unique(np.concatenate((pcst_nodes, topk_nodes)))
@@ -180,7 +189,15 @@ class STaRKQADataset(InMemoryDataset):
             # Retrieve node embedding, label and textual graph description
             with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
                 textual_nodes_df = get_textual_nodes(pcst_nodes, driver)
-                textual_edges_df = get_textual_edges(pcst_edges, driver)
+                textual_nodes_df = textual_nodes_df[textual_nodes_df['name'].notnull()]
+                # Only keep edges whose endpoints remain after node filtering
+                allowed_node_ids = set(int(nid) for nid in textual_nodes_df['nodeId'].tolist())
+                filtered_pcst_edges: list[tuple[int, int]] = (
+                    [(int(src), int(dst)) for src, dst in pcst_edges.tolist() if int(src) in allowed_node_ids and int(dst) in allowed_node_ids]
+                    if pcst_edges.size else []
+                )
+                node_pairs: list[tuple[int, int]] = filtered_pcst_edges
+                textual_edges_df = get_textual_edges(node_pairs, driver)
                 answers = get_textual_nodes(answer_ids[index], driver)['name'].tolist()
 
             # Order nodes by similarity to question
@@ -192,7 +209,11 @@ class STaRKQADataset(InMemoryDataset):
             desc = textualize_graph(textual_nodes_df, textual_edges_df)
             node_embedding = torch.tensor(textual_nodes_df['textEmbedding'].tolist())
             consecutive_map = {id : i for i, id in enumerate(textual_nodes_df['node_id'].values)}
-            edge_index = torch.tensor([(consecutive_map[src], consecutive_map[tgt]) for src, tgt in pcst_edges], dtype=torch.int32).T #when dtype is not specified, it becomes a float tensor when unserialized, weird.
+            edge_pairs = [(int(consecutive_map[src]), int(consecutive_map[tgt])) for src, tgt in filtered_pcst_edges]
+            if len(edge_pairs) == 0:
+                edge_index = torch.empty((2, 0), dtype=torch.int32)
+            else:
+                edge_index = torch.tensor(edge_pairs, dtype=torch.int32).T #when dtype is not specified, it becomes a float tensor when unserialized, weird.
             enriched_data = Data(
                 x=node_embedding,
                 edge_index=edge_index,
