@@ -267,6 +267,7 @@ if __name__ == '__main__':
     parser.add_argument('--algo_config_version', type=int, required=True)
     parser.add_argument('--g_retriever_config_version', type=int, required=True)
     parser.add_argument('--freeze_llm', type=bool, default=False)
+    parser.add_argument('--num_gpus', type=int, default=4)
     args = parser.parse_args()
     load_dotenv('db.env', override=True)
 
@@ -283,7 +284,7 @@ if __name__ == '__main__':
         algo_config_version=args.algo_config_version,
         g_retriever_config_version=args.g_retriever_config_version,
         checkpointing=args.checkpointing,
-        sys_prompt=args.sys_prompt,
+        sys_prompt="You are a helpful assistant that can answer questions about the Amazon product dataset.",
         num_gpus=args.num_gpus
     )
     print(f"Total Time: {time.time() - start_time:2f}s")
