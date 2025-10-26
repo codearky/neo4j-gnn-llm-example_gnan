@@ -82,6 +82,12 @@ def convert_pcst_output(pcst_output) -> (np.array, np.array):
     pcst_edges = np.stack((pcst_src, pcst_tgt), axis=1)
     return pcst_nodes, pcst_edges
 
+def convert_non_pcst_output(relationships_df) -> (np.array, np.array):
+    src = relationships_df['sourceNodeId'].values
+    tgt = relationships_df['targetNodeId'].values
+    unique_nodes = np.unique(np.concatenate([src, tgt]))
+    edges = np.stack((src, tgt), axis=1)
+    return unique_nodes, edges
 
 class STaRKQADataset(InMemoryDataset):
     def __init__(
@@ -98,7 +104,7 @@ class STaRKQADataset(InMemoryDataset):
         self.raw_dataset = raw_dataset
         self.retrieval_config_version = retrieval_config_version
         self.algo_config_version = algo_config_version
-        self.query_embedding_dict = torch.load(os.path.join(os.path.dirname(__file__), 'data-loading/emb/amazon/text-embedding-ada-002/query/query_emb_dict.pt')) # load from parent directory of this file
+        self.query_embedding_dict = torch.load(os.path.join(os.path.dirname(__file__), 'data-loading/emb/prime/text-embedding-ada-002/query/query_emb_dict.pt')) # load from parent directory of this file
 
         super().__init__(root, force_reload=force_reload, transform=transform)
 
@@ -154,30 +160,48 @@ class STaRKQADataset(InMemoryDataset):
 
         # PCST subgraph pruning
         print(f"Compute PCST graphs...")
+        print (f"has {len(dataframe)} rows to process")
 
         with open(f"configs/algo_config_v{self.algo_config_version}.yaml", "r") as f:
             pcst_config = yaml.safe_load(f)
-
+        skip_pcst = pcst_config["skip_pcst"]
+        
         all_pcst_nodes = {} # for metrics only
-        for index, (question_id, prompt, _) in tqdm(dataframe.iterrows()):
+        
+        # Checkpoint setup
+        checkpoint_file = os.path.join(self.processed_dir, f'{self.split}_checkpoint.pt')
+        if os.path.exists(checkpoint_file):
+            print(f"Loading checkpoint from {checkpoint_file}")
+            checkpoint = torch.load(checkpoint_file, weights_only=False)
+            retrieval_data = checkpoint['retrieval_data']
+            all_pcst_nodes = checkpoint['all_pcst_nodes']
+            start_idx = 6000 # checkpoint['last_index'] + 1
+            print(f"Resuming from index {start_idx}")
+        else:
+            start_idx = 0
+        
+        dataframe_items = list(dataframe.iterrows())
+        for i, (index, (question_id, prompt, _)) in enumerate(tqdm(dataframe_items[start_idx:], initial=start_idx, total=len(dataframe))):
             query_emb = self.query_embedding_dict[question_id].numpy()[0]
             nodes_df, relationships_df = base_subgraph[index]
+            if skip_pcst:
+                pcst_nodes, pcst_edges = convert_non_pcst_output(relationships_df)
+            else:
+                with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
+                    topn_nodes = get_nodes_by_vector_search(query_emb, pcst_config["prized_nodes"], driver)
+                    topk_nodes = get_nodes_by_vector_search(query_emb, pcst_config["topk_nodes"], driver) # for union
 
-            with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
-                topn_nodes = get_nodes_by_vector_search(query_emb, pcst_config["prized_nodes"], driver)
-                topk_nodes = get_nodes_by_vector_search(query_emb, pcst_config["topk_nodes"], driver) # for union
+                assign_node_prizes(nodes_df, topn_nodes) #adds column 'nodePrizes'
+                assign_edge_costs(relationships_df) #adds column 'edgeCosts'
 
-            assign_node_prizes(nodes_df, topn_nodes) #adds column 'nodePrizes'
-            assign_edge_costs(relationships_df) #adds column 'edgeCosts'
+                # Run the pcst algorithm
+                gds = GraphDataScience(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+                with gds.graph.construct(graph_name='pcst-graph', nodes=nodes_df, relationships=relationships_df.drop(['sourceNodeType','targetNodeType'], axis=1), undirected_relationship_types=['*']) as G:
+                    pcst_output = gds.prizeSteinerTree.stream(G, prizeProperty='nodePrize', relationshipWeightProperty='edgeCost')
+                pcst_nodes, pcst_edges = convert_pcst_output(pcst_output)
 
-            # Run the pcst algorithm
-            gds = GraphDataScience(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
-            with gds.graph.construct(graph_name='pcst-graph', nodes=nodes_df, relationships=relationships_df.drop(['sourceNodeType','targetNodeType'], axis=1), undirected_relationship_types=['*']) as G:
-                pcst_output = gds.prizeSteinerTree.stream(G, prizeProperty='nodePrize', relationshipWeightProperty='edgeCost')
-            pcst_nodes, pcst_edges = convert_pcst_output(pcst_output)
-
-            # Take union with top25
-            pcst_nodes = np.unique(np.concatenate((pcst_nodes, topk_nodes)))
+                # Take union with top25
+                pcst_nodes = np.unique(np.concatenate((pcst_nodes, topk_nodes)))
 
             # Retrieve node embedding, label and textual graph description
             with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
@@ -204,5 +228,20 @@ class STaRKQADataset(InMemoryDataset):
                 desc=desc,
             )
             retrieval_data.append(enriched_data)
+            
+            # Save checkpoint every 500 iterations
+            if (start_idx + i + 1) % 500 == 0:
+                torch.save({
+                    'retrieval_data': retrieval_data,
+                    'all_pcst_nodes': all_pcst_nodes,
+                    'last_index': i
+                }, checkpoint_file)
+                print(f"\nCheckpoint saved at iteration {start_idx + i + 1}")
+        
         compute_intermediate_metrics(answer_ids, all_pcst_nodes)
         self.save(retrieval_data, self.processed_paths[0])
+        
+        # Clean up checkpoint file after successful completion
+        if os.path.exists(checkpoint_file):
+            os.remove(checkpoint_file)
+            print(f"Checkpoint file removed after successful completion")

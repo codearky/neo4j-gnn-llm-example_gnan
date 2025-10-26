@@ -2,7 +2,7 @@
 
 from stark_qa import load_qa, load_skb
 
-dataset_name = 'amazon'
+dataset_name = 'prime'
 
 # Load the retrieval dataset
 qa_dataset = load_qa(dataset_name)
@@ -21,9 +21,9 @@ print('Query:', query)
 print('Query ID:', q_id)
 print('Answer:\n', '\n\n'.join([str(skb[aid].dictionary) for aid in answer_ids]))
 
-# print(skb.META_DATA)
-# print(skb.NODE_TYPES)
-# print(skb.RELATION_TYPES)
+print(skb.META_DATA)
+print(skb.NODE_TYPES)
+print(skb.RELATION_TYPES)
 
 skb[answer_ids[0]]
 
@@ -36,20 +36,8 @@ node_list = []
 for i in tqdm(range(skb.num_nodes())):
   node = skb[i].dictionary
   node['nodeId'] = i
-  node_list.append(node)
+  node_list.append(skb[i].dictionary)
 node_df = pd.DataFrame(node_list)
-
-# format details and sanitize nested fields for Neo4j
-# Neo4j properties must be primitives or lists of primitives
-if 'review' in node_df.columns:
-  node_df['reviewCount'] = node_df['review'].apply(lambda x: len(x) if isinstance(x, list) else 0)
-  node_df = node_df.drop(columns=['review'])
-if 'qa' in node_df.columns:
-  node_df['qaCount'] = node_df['qa'].apply(lambda x: len(x) if isinstance(x, list) else 0)
-  node_df = node_df.drop(columns=['qa'])
-
-# replace NaN with None so properties are omitted instead of invalid values
-node_df = node_df.where(pd.notnull(node_df), None)
 
 # format details
 node_df.loc[node_df.details.isna(), 'details'] = ''
@@ -200,14 +188,15 @@ import os
 #load neo4j credentials
 
 load_dotenv('../db.env', override=True)
-NEO4J_URI = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
-NEO4J_USERNAME = os.getenv('NEO4J_USERNAME', 'neo4j')
-NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', 'test12345')
+NEO4J_URI = os.getenv('NEO4J_URI')
+NEO4J_USERNAME = os.getenv('NEO4J_USERNAME')
+NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD')
 
 print(os.getenv('NEO4J_URI'))
 
 for ind, node_type in skb.node_type_dict.items():
-  single_node_type_df = node_df.iloc[(skb.node_types == int(ind)).numpy()]
+  single_node_type_df = (node_df[node_df['type']==node_type]
+                         .drop(columns=['type']))
   node_label = format_node_label(node_type)
   load_nodes(single_node_type_df,
                    'nodeId',
@@ -322,11 +311,11 @@ for ind, edge_type in skb.edge_type_dict.items():
 
 # Load pre-generated openai text-embedding-ada-002 embeddings
 # Get emb_download.py from https://github.com/snap-stanford/stark. see Readme for other ways to generate embeddings
-#! python emb_download.py --dataset amazon --emb_dir emb/
+#! python emb_download.py --dataset prime --emb_dir emb/
 
 import torch
 
-emb = torch.load('emb/amazon/text-embedding-ada-002/doc/candidate_emb_dict.pt')
+emb = torch.load('emb/prime/text-embedding-ada-002/doc/candidate_emb_dict.pt')
 
 emb[0]
 
@@ -380,4 +369,4 @@ with GraphDatabase.driver(NEO4J_URI,
 #embedding_model = OpenAIEmbeddings(model="text-embedding-ada-002")
 #reltype_emb = {format_rel_type(v): embedding_model.embed_query(v) for k,v in  skb.edge_type_dict.items()}
 #import torch
-#torch.save(reltype_emb, 'emb/amazon/text-embedding-ada-002/doc/reltype_emb_dict.pt')
+#torch.save(reltype_emb, 'emb/prime/text-embedding-ada-002/doc/reltype_emb_dict.pt')
