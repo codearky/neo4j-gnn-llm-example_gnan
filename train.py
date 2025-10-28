@@ -32,7 +32,7 @@ def get_loss(model, batch, model_save_name) -> Tensor:
     else:
         # calls forward for GRetriever
         return model(batch, batch.question, batch.x, batch.edge_index, batch.batch,
-                     batch.label, batch.edge_attr, batch.desc)
+                     batch.label, batch.edge_attr, None)
 
 
 
@@ -55,6 +55,45 @@ def save_params_dict(model, save_path):
         if k in param_grad_dict.keys() and not param_grad_dict[k]:
             del state_dict[k]  # Delete parameters that do not require gradient
     torch.save(state_dict, save_path)
+
+
+def save_checkpoint(model, optimizer, epoch, step, generator_state, save_path):
+    """Save a complete training checkpoint including optimizer state and training progress."""
+    state_dict = model.state_dict()
+    param_grad_dict = {
+        k: v.requires_grad
+        for (k, v) in model.named_parameters()
+    }
+    for k in list(state_dict.keys()):
+        if k in param_grad_dict.keys() and not param_grad_dict[k]:
+            del state_dict[k]  # Delete parameters that do not require gradient
+    
+    checkpoint = {
+        'model_state_dict': state_dict,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'step': step,
+        'generator_state': generator_state,
+    }
+    torch.save(checkpoint, save_path)
+
+
+def load_checkpoint(model, optimizer, generator, checkpoint_path):
+    """Load a training checkpoint and return the epoch and step to resume from."""
+    checkpoint = torch.load(checkpoint_path)
+    
+    # Load model state
+    state_dict = model.state_dict()
+    state_dict.update(checkpoint['model_state_dict'])
+    model.load_state_dict(state_dict)
+    
+    # Load optimizer state
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Restore generator state
+    generator.set_state(checkpoint['generator_state'])
+    
+    return checkpoint['epoch'], checkpoint['step']
 
 
 def load_params_dict(model, save_path):
@@ -247,8 +286,13 @@ def train(
         test_dataset = STaRKQADataset(root_path, qa_raw_test, retrieval_config_version, algo_config_version, split="test", transform=PreprocessDistances())
         os.makedirs(f'{root_path}/models', exist_ok=True)
 
+    # Use generator with fixed seed for reproducible shuffling
+    train_generator = torch.Generator()
+    train_generator.manual_seed(42)
+    
     train_loader = GNANDataLoader(train_dataset, batch_size=batch_size,
-                              drop_last=True, pin_memory=True, shuffle=True,)
+                              drop_last=True, pin_memory=True, shuffle=True,
+                              generator=train_generator)
     val_loader = GNANDataLoader(val_dataset, batch_size=eval_batch_size,
                             drop_last=False, pin_memory=True, shuffle=False )
     test_loader = GNANDataLoader(test_dataset, batch_size=eval_batch_size,
@@ -306,15 +350,28 @@ def train(
             'weight_decay': 0.05
         },
     ], betas=(0.9, 0.95))
-    grad_steps = 2
+    grad_steps = 8
+
+    # Check for existing checkpoint to resume training
+    checkpoint_path = f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_checkpoint_latest.pt'
+    start_epoch = 0
+    start_step = 0
+    global_step = 0
+    
+    if os.path.exists(checkpoint_path) and load_model_path is None:
+        print(f"Found checkpoint at {checkpoint_path}, resuming training...")
+        start_epoch, start_step = load_checkpoint(model, optimizer, train_generator, checkpoint_path)
+        # Calculate global step
+        global_step = start_epoch * len(train_loader) + start_step
+        print(f"Resuming from epoch {start_epoch}, step {start_step}, global_step {global_step}")
 
     best_epoch = 0
     best_val_loss = float('inf')
     if load_model_path is None:
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             model.train()
             epoch_loss = 0
-            if epoch == 0:
+            if epoch == start_epoch and start_step == 0:
                 print(f"Total Preparation Time: {time.time() - start_time:2f}s")
                 start_time = time.time()
                 print("Training beginning...")
@@ -322,6 +379,10 @@ def train(
             loader = tqdm(train_loader, desc=epoch_str)
 
             for step, batch in enumerate(loader):
+                # Skip already processed steps when resuming from checkpoint
+                if epoch == start_epoch and step < start_step:
+                    continue
+                
                 optimizer.zero_grad()
                 loss = get_loss(model, batch, model_save_name)
                 loss.backward()
@@ -337,6 +398,20 @@ def train(
 
                 if (step + 1) % grad_steps == 0:
                     lr = optimizer.param_groups[0]['lr']
+                
+                # Save checkpoint every 500 steps
+                global_step += 1
+                if global_step % 500 == 0:
+                    print(f"\nSaving checkpoint at global step {global_step}...")
+                    save_checkpoint(
+                        model, 
+                        optimizer, 
+                        epoch, 
+                        step + 1,  # Save next step to start from
+                        train_generator.get_state(),
+                        checkpoint_path
+                    )
+
 
             train_loss = epoch_loss / len(train_loader)
             print(epoch_str + f', Train Loss: {train_loss:4f}')
@@ -394,8 +469,8 @@ def train(
     print(f"Total Training Time: {time.time() - start_time:2f}s")
     save_params_dict(model, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}.pt')
     torch.save(eval_output, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_eval_outs.pt')
-    if num_gnn_layers > 0:
-        torch.save(permuted_eval_output, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_perm_top10_eval_outs.pt')
+    # if num_gnn_layers > 0:
+    #     torch.save(permuted_eval_output, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_perm_top10_eval_outs.pt')
 
 
 if __name__ == '__main__':
@@ -404,7 +479,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_gnn_layers', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--epochs', type=int, default=2)
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--eval_batch_size', type=int, default=16)
     parser.add_argument('--checkpointing', action='store_true')
     parser.add_argument('--llama_version', type=str, required=True)
