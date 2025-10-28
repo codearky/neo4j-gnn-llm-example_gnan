@@ -82,12 +82,45 @@ def convert_pcst_output(pcst_output) -> (np.array, np.array):
     pcst_edges = np.stack((pcst_src, pcst_tgt), axis=1)
     return pcst_nodes, pcst_edges
 
-def convert_non_pcst_output(relationships_df) -> (np.array, np.array):
+def convert_non_pcst_output(relationships_df, query_embedding: np.ndarray, driver: Driver, max_nodes: int = 1000) -> (np.array, np.array):
+    """
+    Filter the graph to top k nodes by vector similarity and keep edges between them.
+    
+    Args:
+        relationships_df: DataFrame with sourceNodeId and targetNodeId columns
+        query_embedding: Question embedding to compute similarity
+        driver: Neo4j driver for fetching node embeddings
+        max_nodes: Maximum number of nodes to keep (default: 1000)
+    
+    Returns:
+        Tuple of (filtered_nodes, filtered_edges)
+    """
     src = relationships_df['sourceNodeId'].values
     tgt = relationships_df['targetNodeId'].values
     unique_nodes = np.unique(np.concatenate([src, tgt]))
-    edges = np.stack((src, tgt), axis=1)
-    return unique_nodes, edges
+    
+    # Get node embeddings and compute similarities
+    textual_nodes_df = get_textual_nodes(unique_nodes.tolist(), driver)
+    textual_nodes_df['vector_similarity'] = textual_nodes_df.apply(
+        lambda row: row['textEmbedding'] @ query_embedding, axis=1
+    )
+    
+    # Sort by similarity and take top k
+    textual_nodes_df = textual_nodes_df.sort_values(by=['vector_similarity'], ascending=False)
+    top_k_nodes = set(textual_nodes_df.head(max_nodes)['nodeId'].tolist())
+    
+    # Filter edges to only include edges between top k nodes
+    filtered_edges = []
+    for s, t in zip(src, tgt):
+        if s in top_k_nodes and t in top_k_nodes:
+            filtered_edges.append([s, t])
+    
+    if len(filtered_edges) > 0:
+        filtered_edges = np.array(filtered_edges)
+    else:
+        filtered_edges = np.empty((0, 2), dtype=int)
+    
+    return np.array(list(top_k_nodes)), filtered_edges
 
 class STaRKQADataset(InMemoryDataset):
     def __init__(
@@ -185,7 +218,9 @@ class STaRKQADataset(InMemoryDataset):
             query_emb = self.query_embedding_dict[question_id].numpy()[0]
             nodes_df, relationships_df = base_subgraph[index]
             if skip_pcst:
-                pcst_nodes, pcst_edges = convert_non_pcst_output(relationships_df)
+                max_nodes = pcst_config.get("max_nodes_no_pcst", 1000)
+                with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
+                    pcst_nodes, pcst_edges = convert_non_pcst_output(relationships_df, query_emb, driver, max_nodes)
             else:
                 with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
                     topn_nodes = get_nodes_by_vector_search(query_emb, pcst_config["prized_nodes"], driver)
