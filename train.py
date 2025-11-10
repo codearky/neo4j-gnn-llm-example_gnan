@@ -30,9 +30,17 @@ def get_loss(model, batch, model_save_name) -> Tensor:
     if model_save_name.startswith('llm'):
         return model(batch.question, batch.label, batch.desc)
     else:
+        # Optionally augment context with PCST nodes and/or GNAN top-k nodes
+        desc_arg = batch.desc
+        try:
+            if (getattr(args, 'include_pcst_desc_context', False)
+                    or getattr(args, 'topk_gnan_nodes_context', 0) > 0):
+                desc_arg = build_augmented_desc(model, batch)
+        except NameError:
+            desc_arg = batch.desc
         # calls forward for GRetriever
         return model(batch, batch.question, batch.x, batch.edge_index, batch.batch,
-                     batch.label, batch.edge_attr, None)
+                     batch.label, batch.edge_attr,  desc_arg)
 
 
 
@@ -40,8 +48,16 @@ def inference_step(model, batch, model_save_name):
     if model_save_name.startswith('llm'):
         return model.inference(batch.question, batch.desc)
     else:
+        # Optionally augment context with PCST nodes and/or GNAN top-k nodes
+        desc_arg = batch.desc
+        try:
+            if (getattr(args, 'include_pcst_desc_context', False)
+                    or getattr(args, 'topk_gnan_nodes_context', 0) > 0):
+                desc_arg = build_augmented_desc(model, batch)
+        except NameError:
+            desc_arg = batch.desc
         return model.inference(batch, batch.question, batch.x, batch.edge_index,
-                               batch.batch, batch.edge_attr, batch.desc)
+                               batch.batch, batch.edge_attr, desc_arg)
 
 
 
@@ -473,6 +489,64 @@ def train(
     #     torch.save(permuted_eval_output, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_perm_top10_eval_outs.pt')
 
 
+def _safe_listify(value):
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def build_augmented_desc(model, batch):
+    """
+    Builds an augmented description list by appending optional PCST textual description
+    and/or GNAN top-k important nodes per graph to the base desc strings.
+    """
+    base_desc_list = _safe_listify(batch.desc)
+    num_graphs = len(base_desc_list)
+    augmented = [d if isinstance(d, str) else str(d) for d in base_desc_list]
+
+    add_pcst_desc = getattr(args, 'include_pcst_desc_context', False)
+    topk = getattr(args, 'topk_gnan_nodes_context', 0)
+
+    # Append only PCST textual description if available
+    if add_pcst_desc:
+        pcst_desc_attr = getattr(batch, 'pcst_desc', None)
+        if pcst_desc_attr is not None:
+            pcst_desc_list = _safe_listify(pcst_desc_attr)
+            for i in range(num_graphs):
+                pcst_desc = pcst_desc_list[i] if i < len(pcst_desc_list) else ""
+                if isinstance(pcst_desc, str) and pcst_desc:
+                    augmented[i] = f"{augmented[i]}\n\nPCST_DESC:\n{pcst_desc}"
+
+    # Append GNAN top-k node indices if requested
+    if topk and topk > 0 and hasattr(model, 'gnn'):
+        try:
+            device =  next(model.gnn.parameters()).device
+            data_for_importance = batch.to(device)
+            with torch.no_grad():
+                contrib = model.gnn.node_importance(data_for_importance)
+                scores = contrib.sum(dim=1)
+                batch_vec = getattr(data_for_importance, 'batch', None)
+                if batch_vec is None:
+                    batch_vec = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
+                for gid in range(num_graphs):
+                    node_mask = (batch_vec == gid).nonzero(as_tuple=False).view(-1)
+                    if node_mask.numel() == 0:
+                        continue
+                    local_scores = scores[node_mask]
+                    k = min(int(topk), local_scores.numel())
+                    top_vals, top_idx_local = torch.topk(local_scores, k=k)
+                    top_idx_global = node_mask[top_idx_local]
+                    # Node ID mapping is not available on Data; include node indices
+                    idx_list = top_idx_global.detach().cpu().tolist()
+                    idx_str = ','.join(str(int(x)) for x in idx_list)
+                    augmented[gid] = f"{augmented[gid]}\n\nIMPORTANT_NODES_FROM_GNN: {idx_str}"
+        except Exception:
+            # If anything goes wrong, just return the base augmented content up to now
+            return augmented
+
+    return augmented
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--gnn_hidden_channels', type=int, default=1536)
@@ -489,6 +563,10 @@ if __name__ == '__main__':
     parser.add_argument('--freeze_llm', type=bool, default=False)
     parser.add_argument('--print_node_description', action='store_true')
     parser.add_argument('--load_model_path', type=str, default=None)
+    parser.add_argument('--include_pcst_desc_context', action='store_true',
+                        help='Append PCST textual description to the context passed to GRetriever.')
+    parser.add_argument('--topk_gnan_nodes_context', type=int, default=0,
+                        help='Append top-k GNAN-important node indices per graph to the context. 0 to disable.')
     args = parser.parse_args()
     load_dotenv('db.env', override=True)
 
