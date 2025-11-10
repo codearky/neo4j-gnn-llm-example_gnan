@@ -197,7 +197,11 @@ class STaRKQADataset(InMemoryDataset):
 
         with open(f"configs/algo_config_v{self.algo_config_version}.yaml", "r") as f:
             pcst_config = yaml.safe_load(f)
-        skip_pcst = pcst_config["skip_pcst"]
+        mode = pcst_config.get("mode", "pcst")  # one of: 'similarity', 'pcst', 'merge'
+        textualize_similarity_graph = pcst_config.get("textualize_similarity_graph", False)
+        textualize_pcst_graph = pcst_config.get("textualize_pcst_graph", True)
+        max_nodes_no_pcst = pcst_config.get("max_nodes_no_pcst", 1000)
+        assert mode in ('similarity', 'pcst', 'merge'), f"Invalid mode: {mode}. Expected one of 'similarity', 'pcst', or 'merge'."
         
         all_pcst_nodes = {} # for metrics only
         
@@ -217,11 +221,17 @@ class STaRKQADataset(InMemoryDataset):
         for i, (index, (question_id, prompt, _)) in enumerate(tqdm(dataframe_items[start_idx:], initial=start_idx, total=len(dataframe))):
             query_emb = self.query_embedding_dict[question_id].numpy()[0]
             nodes_df, relationships_df = base_subgraph[index]
-            if skip_pcst:
-                max_nodes = pcst_config.get("max_nodes_no_pcst", 1000)
+            # initialize per-iteration holders
+            sim_nodes, sim_edges = None, None
+            pcst_nodes, pcst_edges = None, None
+            final_nodes, final_edges = None, None
+
+            if mode == 'similarity':
                 with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
-                    pcst_nodes, pcst_edges = convert_non_pcst_output(relationships_df, query_emb, driver, max_nodes)
-            else:
+                    sim_nodes, sim_edges = convert_non_pcst_output(relationships_df, query_emb, driver, max_nodes_no_pcst)
+                final_nodes = sim_nodes
+                final_edges = sim_edges
+            elif mode in ('pcst', 'merge'):
                 with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
                     topn_nodes = get_nodes_by_vector_search(query_emb, pcst_config["prized_nodes"], driver)
                     topk_nodes = get_nodes_by_vector_search(query_emb, pcst_config["topk_nodes"], driver) # for union
@@ -238,22 +248,71 @@ class STaRKQADataset(InMemoryDataset):
                 # Take union with top25
                 pcst_nodes = np.unique(np.concatenate((pcst_nodes, topk_nodes)))
 
+                # Determine final graph (PCST only or merged with similarity)
+                if mode == 'merge':
+                    with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
+                        sim_nodes, sim_edges = convert_non_pcst_output(relationships_df, query_emb, driver, max_nodes_no_pcst)
+                    union_nodes = np.unique(np.concatenate((pcst_nodes, sim_nodes)))
+                    # Build induced edges among union nodes from base relationships
+                    src_all = relationships_df['sourceNodeId'].values
+                    tgt_all = relationships_df['targetNodeId'].values
+                    union_set = set(union_nodes.tolist())
+                    induced_edges = []
+                    for s, t in zip(src_all, tgt_all):
+                        if s in union_set and t in union_set:
+                            induced_edges.append([s, t])
+                    final_nodes = union_nodes
+                    if len(induced_edges) > 0:
+                        final_edges = np.array(induced_edges)
+                    else:
+                        final_edges = np.empty((0, 2), dtype=int)
+                else:
+                    final_nodes = pcst_nodes
+                    final_edges = pcst_edges
+            else:
+                raise ValueError(f"Unsupported mode: {mode}. Expected one of 'similarity', 'pcst', or 'merge'.")
+
             # Retrieve node embedding, label and textual graph description
             with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
-                textual_nodes_df = get_textual_nodes(pcst_nodes, driver)
-                textual_edges_df = get_textual_edges(pcst_edges, driver)
+                textual_nodes_df_all = get_textual_nodes(final_nodes, driver)
+                textual_edges_df_final = get_textual_edges(final_edges, driver)
+                # Prepare PCST and similarity textual edges if applicable
+                textual_edges_df_pcst = get_textual_edges(pcst_edges, driver) if (pcst_edges is not None) else None
+                textual_edges_df_sim = get_textual_edges(sim_edges, driver) if (sim_edges is not None) else None
                 answers = get_textual_nodes(answer_ids[index], driver)['name'].tolist()
 
             # Order nodes by similarity to question
-            textual_nodes_df['vector_similarity'] = textual_nodes_df.apply(lambda row: row['textEmbedding'] @ query_emb, axis=1)
-            textual_nodes_df = textual_nodes_df.sort_values(by=['vector_similarity'], ascending=False)
-            all_pcst_nodes[index] = textual_nodes_df['nodeId'].tolist() # for metrics only
+            textual_nodes_df_all['vector_similarity'] = textual_nodes_df_all.apply(lambda row: row['textEmbedding'] @ query_emb, axis=1)
+            textual_nodes_df_all = textual_nodes_df_all.sort_values(by=['vector_similarity'], ascending=False)
+            # Keep node_id for mapping without mutating this DataFrame via textualize_graph
+            textual_nodes_df_all = textual_nodes_df_all.copy()
+            textual_nodes_df_all['node_id'] = textual_nodes_df_all['nodeId']
+            # Metrics storage: store final nodes
+            all_pcst_nodes[index] = textual_nodes_df_all['nodeId'].tolist()
 
             # Generate textualized graph
-            desc = textualize_graph(textual_nodes_df, textual_edges_df)
-            node_embedding = torch.tensor(textual_nodes_df['textEmbedding'].tolist())
-            consecutive_map = {id : i for i, id in enumerate(textual_nodes_df['node_id'].values)}
-            edge_index = torch.tensor([(consecutive_map[src], consecutive_map[tgt]) for src, tgt in pcst_edges], dtype=torch.int32).T #when dtype is not specified, it becomes a float tensor when unserialized, weird.
+            desc = ""
+            pcst_desc = ""
+            # If PCST is in use, keep previous behavior for desc (PCST textualization), and also set pcst_desc if enabled
+            if pcst_nodes is not None:
+                tn_pcst = textual_nodes_df_all[textual_nodes_df_all['nodeId'].isin(pcst_nodes)].copy()
+                if textualize_pcst_graph:
+                    pcst_desc = textualize_graph(tn_pcst, textual_edges_df_pcst if textual_edges_df_pcst is not None else pd.DataFrame(columns=['src','edge_attr','dst']))
+                # Maintain existing behavior for desc with PCST
+                if mode in ('pcst', 'merge'):
+                    desc = pcst_desc
+            # Similarity textualization only when requested or when PCST is skipped
+            if mode == 'similarity' and textualize_similarity_graph:
+                tn_sim = textual_nodes_df_all.copy()  # final graph equals similarity graph here
+                desc = textualize_graph(tn_sim, textual_edges_df_final)
+            elif mode == 'merge' and textualize_similarity_graph and (sim_nodes is not None):
+                tn_sim = textual_nodes_df_all[textual_nodes_df_all['nodeId'].isin(sim_nodes)].copy()
+                sim_edges_df = textual_edges_df_sim if textual_edges_df_sim is not None else pd.DataFrame(columns=['src','edge_attr','dst'])
+                desc = textualize_graph(tn_sim, sim_edges_df)
+
+            node_embedding = torch.tensor(textual_nodes_df_all['textEmbedding'].tolist())
+            consecutive_map = {id : i for i, id in enumerate(textual_nodes_df_all['node_id'].values)}
+            edge_index = torch.tensor([(consecutive_map[src], consecutive_map[tgt]) for src, tgt in final_edges], dtype=torch.int32).T #when dtype is not specified, it becomes a float tensor when unserialized, weird.
             enriched_data = Data(
                 x=node_embedding,
                 edge_index=edge_index,
@@ -262,6 +321,10 @@ class STaRKQADataset(InMemoryDataset):
                 label=('|').join(answers).lower(),
                 desc=desc,
             )
+            # Attach PCST node list and pcst_desc if PCST was used
+            if pcst_nodes is not None:
+                enriched_data.pcst_nodes = list(map(int, pcst_nodes.tolist() if isinstance(pcst_nodes, np.ndarray) else pcst_nodes))
+                enriched_data.pcst_desc = pcst_desc if textualize_pcst_graph else ""
             retrieval_data.append(enriched_data)
             
             # Save checkpoint every 500 iterations
@@ -274,6 +337,19 @@ class STaRKQADataset(InMemoryDataset):
                 print(f"\nCheckpoint saved at iteration {start_idx + i + 1}")
         
         compute_intermediate_metrics(answer_ids, all_pcst_nodes)
+        
+        # Dataset graph statistics
+        if len(retrieval_data) > 0:
+            node_counts = [int(d.x.size(0)) for d in retrieval_data]
+            edge_counts = [int(d.edge_index.size(1)) for d in retrieval_data]
+            avg_nodes = float(np.mean(node_counts))
+            med_nodes = float(np.median(node_counts))
+            avg_edges = float(np.mean(edge_counts))
+            med_edges = float(np.median(edge_counts))
+            print(f"{self.split} dataset graph stats -> avg_nodes: {avg_nodes:.2f}, med_nodes: {med_nodes:.0f}, avg_edges: {avg_edges:.2f}, med_edges: {med_edges:.0f}")
+        else:
+            print(f"{self.split} dataset graph stats -> no graphs constructed")
+        
         self.save(retrieval_data, self.processed_paths[0])
         
         # Clean up checkpoint file after successful completion
