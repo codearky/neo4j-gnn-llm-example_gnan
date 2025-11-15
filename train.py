@@ -3,6 +3,7 @@ import math
 import os
 import time
 import io
+import json
 import pandas as pd
 
 import torch
@@ -24,6 +25,11 @@ from compute_metrics import compute_metrics
 from STaRKQADatasetGDS import STaRKQADataset
 from STaRKQAVectorSearchDataset import STaRKQAVectorSearchDataset
 from torch_geometric.transforms.gnan import PreprocessDistances
+
+# Global variable for intersection log file path
+_intersection_log_file = None
+_current_epoch = None
+_current_step = None
 
 
 def get_loss(model, batch, model_save_name) -> Tensor:
@@ -265,6 +271,8 @@ def train(
         param_group['lr'] = lr
         return lr
 
+    global _intersection_log_file, _current_epoch, _current_step
+    
     start_time = time.time()
     qa_dataset = load_qa("prime")
     qa_raw_train = qa_dataset.get_subset('train')
@@ -301,6 +309,12 @@ def train(
         print("Loading stark-qa prime test dataset...")
         test_dataset = STaRKQADataset(root_path, qa_raw_test, retrieval_config_version, algo_config_version, split="test", transform=PreprocessDistances())
         os.makedirs(f'{root_path}/models', exist_ok=True)
+
+    # Set up intersection log file
+    _intersection_log_file = f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_gnan_pcst_intersection.log'
+    # Clear the log file if it exists
+    if os.path.exists(_intersection_log_file):
+        os.remove(_intersection_log_file)
 
     # Use generator with fixed seed for reproducible shuffling
     train_generator = torch.Generator()
@@ -385,6 +399,7 @@ def train(
     best_val_loss = float('inf')
     if load_model_path is None:
         for epoch in range(start_epoch, num_epochs):
+            _current_epoch = epoch  # Set global for logging
             model.train()
             epoch_loss = 0
             if epoch == start_epoch and start_step == 0:
@@ -395,6 +410,7 @@ def train(
             loader = tqdm(train_loader, desc=epoch_str)
 
             for step, batch in enumerate(loader):
+                _current_step = step  # Set global for logging
                 # Skip already processed steps when resuming from checkpoint
                 if epoch == start_epoch and step < start_step:
                     continue
@@ -459,6 +475,8 @@ def train(
 
     model.eval()
     eval_output = []
+    node_importance_data = [] if (num_gnn_layers > 0 and getattr(args, 'save_node_importance', False)) else None
+    
     print("Final evaluation...")
     progress_bar_test = tqdm(range(len(test_loader)))
     for step, batch in enumerate(test_loader):
@@ -473,14 +491,48 @@ def train(
                 'label': batch.label
             }
             eval_output.append(eval_data)
+            
+            # Collect node importance scores if requested
+            if node_importance_data is not None and hasattr(model, 'gnn'):
+                try:
+                    device = next(model.gnn.parameters()).device
+                    batch_on_device = batch.to(device)
+                    contrib = model.gnn.node_importance(batch_on_device)
+                    scores = contrib.sum(dim=1).detach().cpu().numpy()
+                    batch_vec = getattr(batch_on_device, 'batch', None)
+                    if batch_vec is None:
+                        batch_vec = torch.zeros(scores.shape[0], dtype=torch.long)
+                    else:
+                        batch_vec = batch_vec.cpu()
+                    
+                    # Split scores by graph
+                    num_graphs_in_batch = batch_vec.max().item() + 1 if batch_vec.numel() > 0 else 1
+                    for gid in range(num_graphs_in_batch):
+                        node_mask = (batch_vec == gid).nonzero(as_tuple=False).view(-1)
+                        graph_scores = scores[node_mask].tolist()
+                        node_importance_data.append({
+                            'batch_idx': step,
+                            'graph_idx': gid,
+                            'node_scores': graph_scores,
+                            'num_nodes': len(graph_scores)
+                        })
+                except Exception as e:
+                    print(f"Warning: Failed to compute node importance for batch {step}: {e}")
         progress_bar_test.update(1)
 
     compute_metrics(eval_output)
+    
+    # Save node importance data if collected
+    if node_importance_data is not None:
+        importance_path = f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}_node_importance.json'
+        with open(importance_path, 'w') as f:
+            json.dump(node_importance_data, f, indent=2)
+        print(f"Node importance scores saved to: {importance_path}")
     # Permuted-topk evaluation for GNAN models
-    # if num_gnn_layers > 0:
-        # permuted_eval_output = evaluate_with_permuted_topk_node_features(model, test_dataset, topk=10)
-        # print("\nPermuted-top-10 metrics:")
-        # compute_metrics(eval_output)
+    if num_gnn_layers > 0:
+        permuted_eval_output = evaluate_with_permuted_topk_node_features(model, test_dataset, topk=10)
+        print("\nPermuted-top-10 metrics:")
+        compute_metrics(eval_output)
 
     print(f"Total Training Time: {time.time() - start_time:2f}s")
     save_params_dict(model, f'{root_path}/models/{retrieval_config_version}_{algo_config_version}_{g_retriever_config_version}_{model_save_name}.pt')
@@ -493,6 +545,73 @@ def _safe_listify(value):
     if isinstance(value, (list, tuple)):
         return list(value)
     return [value]
+
+
+def _compute_and_print_pcst_gnan_intersection(batch, topk_indices_per_graph, log_file, epoch=None, step=None):
+    """
+    Compute intersection statistics between GNAN top-k nodes and PCST nodes and write to file.
+    
+    Args:
+        batch: The batch containing pcst_nodes attribute
+        topk_indices_per_graph: Dict mapping graph_id -> list of top-k node indices
+        log_file: File path to write the intersection statistics
+        epoch: Optional epoch number for logging
+        step: Optional step/iteration number for logging
+    """
+    pcst_nodes_attr = getattr(batch, 'pcst_nodes', None)
+    if pcst_nodes_attr is None:
+        return
+    
+    # Handle different possible formats of pcst_nodes
+    pcst_nodes_list = _safe_listify(pcst_nodes_attr)
+    num_graphs = len(topk_indices_per_graph)
+    
+    # If pcst_nodes is a single flat list, broadcast it
+    if len(pcst_nodes_list) != num_graphs and num_graphs > 0:
+        pcst_nodes_list = [pcst_nodes_list for _ in range(num_graphs)]
+    
+    total_intersection = 0
+    total_k = 0
+    total_pcst = 0
+    
+    for gid in topk_indices_per_graph:
+        if gid >= len(pcst_nodes_list):
+            continue
+            
+        topk_indices = set(topk_indices_per_graph[gid])
+        pcst_nodes = pcst_nodes_list[gid]
+        
+        # Convert pcst_nodes to set of indices (they should already be indices in the local graph)
+        if isinstance(pcst_nodes, (list, tuple)):
+            pcst_set = set(int(n) for n in pcst_nodes)
+        else:
+            pcst_set = {int(pcst_nodes)}
+        
+        intersection = topk_indices & pcst_set
+        total_intersection += len(intersection)
+        total_k += len(topk_indices)
+        total_pcst += len(pcst_set)
+    
+    if total_k > 0 and total_pcst > 0:
+        # Build log message with epoch/step info
+        prefix = ""
+        if epoch is not None:
+            prefix = f"Epoch {epoch}"
+            if step is not None:
+                prefix += f", Step {step}"
+        elif step is not None:
+            prefix = f"Step {step}"
+        
+        if prefix:
+            prefix += ": "
+        
+        log_msg = (f"{prefix}GNAN-PCST Intersection: {total_intersection}/{total_k} of top-k nodes, "
+                   f"{total_intersection}/{total_pcst} of PCST nodes "
+                   f"(k={total_k}, |PCST|={total_pcst})\n")
+        
+        # Write to file
+        with open(log_file, 'a') as f:
+            f.write(log_msg)
 
 
 def build_augmented_desc(model, batch):
@@ -522,6 +641,7 @@ def build_augmented_desc(model, batch):
         try:
             device =  next(model.gnn.parameters()).device
             data_for_importance = batch.to(device)
+            topk_indices_per_graph = {}
             with torch.no_grad():
                 contrib = model.gnn.node_importance(data_for_importance)
                 scores = contrib.sum(dim=1)
@@ -538,8 +658,16 @@ def build_augmented_desc(model, batch):
                     top_idx_global = node_mask[top_idx_local]
                     # Node ID mapping is not available on Data; include node indices
                     idx_list = top_idx_global.detach().cpu().tolist()
+                    topk_indices_per_graph[gid] = idx_list
                     idx_str = ','.join(str(int(x)) for x in idx_list)
                     augmented[gid] = f"{augmented[gid]}\n\nIMPORTANT_NODES_FROM_GNN: {idx_str}"
+            
+            # Log intersection statistics with PCST nodes
+            if _intersection_log_file is not None:
+                _compute_and_print_pcst_gnan_intersection(
+                    batch, topk_indices_per_graph, _intersection_log_file, 
+                    epoch=_current_epoch, step=_current_step
+                )
         except Exception:
             # If anything goes wrong, just return the base augmented content up to now
             return augmented
@@ -567,6 +695,8 @@ if __name__ == '__main__':
                         help='Append PCST textual description to the context passed to GRetriever.')
     parser.add_argument('--topk_gnan_nodes_context', type=int, default=0,
                         help='Append top-k GNAN-important node indices per graph to the context. 0 to disable.')
+    parser.add_argument('--save_node_importance', action='store_true',
+                        help='Save all node importance scores from GNAN to JSON during final test evaluation.')
     args = parser.parse_args()
     load_dotenv('db.env', override=True)
 
