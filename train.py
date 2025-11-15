@@ -574,6 +574,35 @@ def _compute_and_print_pcst_gnan_intersection(batch, topk_indices_per_graph, log
     total_k = 0
     total_pcst = 0
     
+    # Get graph structure info from batch
+    batch_vec = getattr(batch, 'batch', None)
+    edge_index = getattr(batch, 'edge_index', None)
+    
+    # Compute nodes and edges per graph
+    graph_node_counts = {}
+    graph_edge_counts = {}
+    
+    if batch_vec is not None:
+        for gid in range(num_graphs):
+            node_mask = (batch_vec == gid).nonzero(as_tuple=False).view(-1)
+            graph_node_counts[gid] = node_mask.numel()
+    else:
+        # Single graph case
+        graph_node_counts[0] = batch.x.size(0) if hasattr(batch, 'x') else 0
+    
+    if edge_index is not None and edge_index.numel() > 0:
+        if batch_vec is not None:
+            # Map edges to graphs based on source node
+            src_nodes = edge_index[0]
+            for gid in range(num_graphs):
+                node_mask = (batch_vec == gid).nonzero(as_tuple=False).view(-1)
+                node_set = set(node_mask.tolist())
+                edge_mask = torch.tensor([int(src.item()) in node_set for src in src_nodes], dtype=torch.bool)
+                graph_edge_counts[gid] = edge_mask.sum().item()
+        else:
+            # Single graph case
+            graph_edge_counts[0] = edge_index.size(1)
+    
     for gid in topk_indices_per_graph:
         if gid >= len(pcst_nodes_list):
             continue
@@ -605,9 +634,18 @@ def _compute_and_print_pcst_gnan_intersection(batch, topk_indices_per_graph, log
         if prefix:
             prefix += ": "
         
+        # Build graph stats string
+        graph_stats_parts = []
+        for gid in sorted(graph_node_counts.keys()):
+            num_nodes = graph_node_counts.get(gid, 0)
+            num_edges = graph_edge_counts.get(gid, 0)
+            graph_stats_parts.append(f"Graph {gid}: {num_nodes} nodes, {num_edges} edges")
+        graph_stats_str = "; ".join(graph_stats_parts)
+        
         log_msg = (f"{prefix}GNAN-PCST Intersection: {total_intersection}/{total_k} of top-k nodes, "
                    f"{total_intersection}/{total_pcst} of PCST nodes "
-                   f"(k={total_k}, |PCST|={total_pcst})\n")
+                   f"(k={total_k}, |PCST|={total_pcst})\n"
+                   f"Graph stats: {graph_stats_str}\n")
         
         # Write to file
         with open(log_file, 'a') as f:
@@ -616,17 +654,25 @@ def _compute_and_print_pcst_gnan_intersection(batch, topk_indices_per_graph, log
 
 def build_augmented_desc(model, batch):
     """
-    Builds an augmented description list by appending optional PCST textual description
-    and/or GNAN top-k important nodes per graph to the base desc strings.
+    Builds description for the model context.
+    - If use_full_graph_context is True: returns original desc unchanged
+    - If use_full_graph_context is False: creates NEW desc from PCST/GNAN content only
     """
     base_desc_list = _safe_listify(batch.desc)
     num_graphs = len(base_desc_list)
-    augmented = [d if isinstance(d, str) else str(d) for d in base_desc_list]
 
+    # If using full graph context, return original desc unchanged
+    use_full_graph = getattr(args, 'use_full_graph_context', False)
+    if use_full_graph:
+        return [d if isinstance(d, str) else str(d) for d in base_desc_list]
+
+    # Otherwise, create NEW description from PCST/GNAN content only
+    new_desc = [""] * num_graphs  # Start with empty descriptions
+    
     add_pcst_desc = getattr(args, 'include_pcst_desc_context', False)
     topk = getattr(args, 'topk_gnan_nodes_context', 0)
 
-    # Append only PCST textual description if available
+    # Add PCST textual description if available
     if add_pcst_desc:
         pcst_desc_attr = getattr(batch, 'pcst_desc', None)
         if pcst_desc_attr is not None:
@@ -634,9 +680,12 @@ def build_augmented_desc(model, batch):
             for i in range(num_graphs):
                 pcst_desc = pcst_desc_list[i] if i < len(pcst_desc_list) else ""
                 if isinstance(pcst_desc, str) and pcst_desc:
-                    augmented[i] = f"{augmented[i]}\n\nPCST_DESC:\n{pcst_desc}"
+                    if new_desc[i]:
+                        new_desc[i] = f"{new_desc[i]}\n\nPCST_DESC:\n{pcst_desc}"
+                    else:
+                        new_desc[i] = f"PCST_DESC:\n{pcst_desc}"
 
-    # Append GNAN top-k node indices if requested
+    # Add GNAN top-k node indices if requested
     if topk and topk > 0 and hasattr(model, 'gnn'):
         try:
             device =  next(model.gnn.parameters()).device
@@ -660,7 +709,10 @@ def build_augmented_desc(model, batch):
                     idx_list = top_idx_global.detach().cpu().tolist()
                     topk_indices_per_graph[gid] = idx_list
                     idx_str = ','.join(str(int(x)) for x in idx_list)
-                    augmented[gid] = f"{augmented[gid]}\n\nIMPORTANT_NODES_FROM_GNN: {idx_str}"
+                    if new_desc[gid]:
+                        new_desc[gid] = f"{new_desc[gid]}\n\nIMPORTANT_NODES_FROM_GNN: {idx_str}"
+                    else:
+                        new_desc[gid] = f"IMPORTANT_NODES_FROM_GNN: {idx_str}"
             
             # Log intersection statistics with PCST nodes
             if _intersection_log_file is not None:
@@ -669,10 +721,10 @@ def build_augmented_desc(model, batch):
                     epoch=_current_epoch, step=_current_step
                 )
         except Exception:
-            # If anything goes wrong, just return the base augmented content up to now
-            return augmented
+            # If anything goes wrong, just return what we have so far
+            return new_desc
 
-    return augmented
+    return new_desc
 
 
 if __name__ == '__main__':
@@ -697,6 +749,8 @@ if __name__ == '__main__':
                         help='Append top-k GNAN-important node indices per graph to the context. 0 to disable.')
     parser.add_argument('--save_node_importance', action='store_true',
                         help='Save all node importance scores from GNAN to JSON during final test evaluation.')
+    parser.add_argument('--use_full_graph_context', action='store_true',
+                        help='Use full graph in context without augmentation. Overrides PCST and GNAN augmentation flags.')
     args = parser.parse_args()
     load_dotenv('db.env', override=True)
 
