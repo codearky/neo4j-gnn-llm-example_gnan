@@ -56,6 +56,66 @@ def get_textual_edges(node_pairs: list[tuple[int, int]], driver: Driver) -> Data
                                parameters_={"node_pairs": node_pairs})
     return pd.DataFrame([rec.data() for rec in res.records])
 
+def expand_graph_by_hops(
+    initial_seeds: list[int],
+    query_embedding: np.ndarray,
+    driver: Driver,
+    expand_hops: int,
+    expand_topk_per_seed: Optional[int],
+) -> pd.DataFrame:
+    """
+    Expand from initial seed nodes by a number of hops. At each hop, for each seed
+    node in the frontier, select at most 'expand_topk_per_seed' neighbors with
+    highest vector similarity to the question embedding. If expand_topk_per_seed
+    is None or <= 0, keep all neighbors (default behavior).
+    Returns a DataFrame with columns: sourceNodeId, targetNodeId, relationshipType, sourceNodeType, targetNodeType
+    """
+    # Default/edge cases: treat non-positive as no pruning
+    k_per_seed = None if (expand_topk_per_seed is None or expand_topk_per_seed <= 0) else int(expand_topk_per_seed)
+    # Track visited to avoid redundant expansions
+    visited: set[int] = set(initial_seeds)
+    frontier: set[int] = set(initial_seeds)
+    all_edges: list[dict] = []
+    for _ in range(max(0, int(expand_hops))):
+        if not frontier:
+            break
+        step_sources = list(frontier)
+        rels_df = cypher_retrieval(step_sources, driver)
+        if rels_df.empty:
+            frontier = set()
+            continue
+        if k_per_seed is None:
+            # Keep all edges
+            all_edges.extend(rels_df.to_dict('records'))
+            # Next frontier are all targets
+            next_targets = set(rels_df['targetNodeId'].tolist())
+        else:
+            # Compute similarity for unique neighbors
+            neighbor_ids = sorted(set(rels_df['targetNodeId'].tolist()))
+            if neighbor_ids:
+                textual_neighbors = get_textual_nodes(neighbor_ids, driver)
+                textual_neighbors['vector_similarity'] = textual_neighbors.apply(
+                    lambda row: row['textEmbedding'] @ query_embedding, axis=1
+                )
+                sim_map = dict(zip(textual_neighbors['nodeId'].tolist(), textual_neighbors['vector_similarity'].tolist()))
+            else:
+                sim_map = {}
+            # Prune neighbors per source
+            pruned_edges: list[dict] = []
+            next_targets = set()
+            for src_id, group in rels_df.groupby('sourceNodeId'):
+                rows = group.to_dict('records')
+                rows.sort(key=lambda r: sim_map.get(r['targetNodeId'], float('-inf')), reverse=True)
+                kept = rows[:k_per_seed]
+                pruned_edges.extend(kept)
+                next_targets.update([r['targetNodeId'] for r in kept])
+            all_edges.extend(pruned_edges)
+        # Prepare next frontier: newly discovered targets (can include already visited but it's ok to skip)
+        new_frontier = next_targets - visited
+        visited.update(next_targets)
+        frontier = new_frontier
+    return pd.DataFrame(all_edges)
+
 def textualize_graph(textual_nodes_df, textual_edges_df):
     textual_nodes_df.description.fillna("")
     textual_nodes_df['node_attr'] = textual_nodes_df.apply(
@@ -179,7 +239,20 @@ class STaRKQADataset(InMemoryDataset):
                 query_emb = self.query_embedding_dict[question_id].numpy()[0]
                 with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
                     topk_node_ids = get_nodes_by_vector_search(query_emb, 25*cypher_config['k_nodes'], driver)[:cypher_config['k_nodes']]
-                    relationships_df = cypher_retrieval(topk_node_ids, driver) # Variations of cypher queries are supported here
+                    # Optional hop expansion with per-seed pruning
+                    expand_hops = int(cypher_config.get('expand_hops', 1))
+                    expand_topk_per_seed = cypher_config.get('expand_topk_per_seed', None)
+                    if expand_hops == 1 and (expand_topk_per_seed is None or int(expand_topk_per_seed) <= 0):
+                        # Default behavior: single hop, no per-seed pruning
+                        relationships_df = cypher_retrieval(topk_node_ids, driver)
+                    else:
+                        relationships_df = expand_graph_by_hops(
+                            initial_seeds=topk_node_ids,
+                            query_embedding=query_emb,
+                            driver=driver,
+                            expand_hops=expand_hops,
+                            expand_topk_per_seed=(None if expand_topk_per_seed is None else int(expand_topk_per_seed)),
+                        )
 
                 nodes = np.unique(np.concatenate((relationships_df['sourceNodeId'].values, relationships_df['targetNodeId'].values)))
                 nodes_df = pd.DataFrame({'nodeId': nodes})
