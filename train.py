@@ -530,8 +530,8 @@ def train(
         print(f"Node importance scores saved to: {importance_path}")
     # Permuted-topk evaluation for GNAN models
     if num_gnn_layers > 0:
-        permuted_eval_output = evaluate_with_permuted_topk_node_features(model, test_dataset, topk=10)
-        print("\nPermuted-top-10 metrics:")
+        # permuted_eval_output = evaluate_with_permuted_topk_node_features(model, test_dataset, topk=10)
+        # print("\nPermuted-top-10 metrics:")
         compute_metrics(eval_output)
 
     print(f"Total Training Time: {time.time() - start_time:2f}s")
