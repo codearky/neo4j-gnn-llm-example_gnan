@@ -2,4 +2,6 @@ edge_embedding_method: "none"
 prized_nodes: 100
 topk_nodes: 25
 max_nodes_no_pcst: 200
-mode: similarity
+mode: merge
+expand_hops: 3
+expand_topk_per_seed: 5
