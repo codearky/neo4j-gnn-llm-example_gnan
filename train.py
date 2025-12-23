@@ -9,14 +9,13 @@ import pandas as pd
 import torch
 from dotenv import load_dotenv
 from torch_geometric.loader import DataLoader
-from torch_geometric.loader.gnan_dataloader import GNANDataLoader
 
 
 from stark_qa import load_qa
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torch_geometric import seed_everything
-from torch_geometric.nn import GRetriever, TensorGNAN
+from torch_geometric.nn import GAT, GRetriever
 from torch_geometric.nn.nlp import LLM
 from tqdm import tqdm
 
@@ -24,7 +23,6 @@ from compute_metrics import compute_metrics
 
 from STaRKQADatasetGDS import STaRKQADataset
 from STaRKQAVectorSearchDataset import STaRKQAVectorSearchDataset
-from torch_geometric.transforms.gnan import PreprocessDistances
 
 # Global variable for intersection log file path
 _intersection_log_file = None
@@ -127,6 +125,11 @@ def load_params_dict(model, save_path):
 
 
 def print_node_importance_examples(model, test_dataset, print_node_description: bool, num_examples: int = 3):
+    # Skip if GNN doesn't support node_importance (e.g., GAT)
+    if not hasattr(model, 'gnn') or not hasattr(model.gnn, 'node_importance'):
+        print("\nNode importance not supported for this GNN model.")
+        return
+    
     print(f"\nNode importance on {num_examples} random test examples:")
     sample_indices = torch.randperm(len(test_dataset))[:num_examples].tolist()
     for idx in sample_indices:
@@ -191,6 +194,11 @@ def print_node_importance_examples(model, test_dataset, print_node_description: 
 
 
 def evaluate_with_permuted_topk_node_features(model, test_dataset, topk: int = 30):
+    # Skip if GNN doesn't support node_importance (e.g., GAT)
+    if not hasattr(model, 'gnn') or not hasattr(model.gnn, 'node_importance'):
+        print("\nNode importance evaluation not supported for this GNN model.")
+        return []
+    
     print(f"\nEvaluating with permuted features among top-{topk} important nodes per graph...")
     eval_output = []
     progress_bar = tqdm(range(len(test_dataset)))
@@ -302,12 +310,12 @@ def train(
         os.makedirs(f'{root_path}/models', exist_ok=True)
     else:
         root_path = f"stark_qa_v{retrieval_config_version}_{algo_config_version}"
-        train_dataset = STaRKQADataset(root_path, qa_raw_train, retrieval_config_version, algo_config_version, split="train", transform=PreprocessDistances())
+        train_dataset = STaRKQADataset(root_path, qa_raw_train, retrieval_config_version, algo_config_version, split="train")
         print(f'Finished loading train dataset in {time.time() - t} seconds.')
         print("Loading stark-qa prime val dataset...")
-        val_dataset = STaRKQADataset(root_path, qa_raw_val, retrieval_config_version, algo_config_version, split="val", transform=PreprocessDistances())
+        val_dataset = STaRKQADataset(root_path, qa_raw_val, retrieval_config_version, algo_config_version, split="val")
         print("Loading stark-qa prime test dataset...")
-        test_dataset = STaRKQADataset(root_path, qa_raw_test, retrieval_config_version, algo_config_version, split="test", transform=PreprocessDistances())
+        test_dataset = STaRKQADataset(root_path, qa_raw_test, retrieval_config_version, algo_config_version, split="test")
         os.makedirs(f'{root_path}/models', exist_ok=True)
 
     # Set up intersection log file
@@ -320,21 +328,20 @@ def train(
     train_generator = torch.Generator()
     train_generator.manual_seed(42)
     
-    train_loader = GNANDataLoader(train_dataset, batch_size=batch_size,
+    train_loader = DataLoader(train_dataset, batch_size=batch_size,
                               drop_last=True, pin_memory=True, shuffle=True,
                               generator=train_generator)
-    val_loader = GNANDataLoader(val_dataset, batch_size=eval_batch_size,
+    val_loader = DataLoader(val_dataset, batch_size=eval_batch_size,
                             drop_last=False, pin_memory=True, shuffle=False )
-    test_loader = GNANDataLoader(test_dataset, batch_size=eval_batch_size,
+    test_loader = DataLoader(test_dataset, batch_size=eval_batch_size,
                              drop_last=False, pin_memory=True, shuffle=False)
 
-    gnn = TensorGNAN(
+    gnn = GAT(
         in_channels=1536,
         hidden_channels=hidden_channels,
         out_channels=1536,
-        n_layers=num_gnn_layers,
-        normalize_rho=True,
-        feature_groups=[list(range(1536))],
+        num_layers=num_gnn_layers,
+        heads=4,
     )
 
     if llama_version == 'tiny_llama':
@@ -493,7 +500,7 @@ def train(
             eval_output.append(eval_data)
             
             # Collect node importance scores if requested
-            if node_importance_data is not None and hasattr(model, 'gnn'):
+            if node_importance_data is not None and hasattr(model, 'gnn') and hasattr(model.gnn, 'node_importance'):
                 try:
                     device = next(model.gnn.parameters()).device
                     batch_on_device = batch.to(device)
@@ -686,7 +693,7 @@ def build_augmented_desc(model, batch):
                         new_desc[i] = f"PCST_DESC:\n{pcst_desc}"
 
     # Add GNAN top-k node indices if requested
-    if topk and topk > 0 and hasattr(model, 'gnn'):
+    if topk and topk > 0 and hasattr(model, 'gnn') and hasattr(model.gnn, 'node_importance'):
         try:
             device =  next(model.gnn.parameters()).device
             data_for_importance = batch.to(device)
