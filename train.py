@@ -15,7 +15,7 @@ from stark_qa import load_qa
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torch_geometric import seed_everything
-from torch_geometric.nn import GAT, GRetriever
+from torch_geometric.nn import GAT, GCN, GIN, GRetriever
 from torch_geometric.nn.nlp import LLM
 from tqdm import tqdm
 
@@ -260,6 +260,7 @@ def train(
     retrieval_config_version,
     algo_config_version,
     g_retriever_config_version,
+    gnn_type='gat',
     checkpointing=False,
     sys_prompt=None,
     num_gpus=None,
@@ -336,13 +337,32 @@ def train(
     test_loader = DataLoader(test_dataset, batch_size=eval_batch_size,
                              drop_last=False, pin_memory=True, shuffle=False)
 
-    gnn = GAT(
-        in_channels=1536,
-        hidden_channels=hidden_channels,
-        out_channels=1536,
-        num_layers=num_gnn_layers,
-        heads=4,
-    )
+    # Create GNN based on gnn_type argument
+    gnn_type_lower = gnn_type.lower()
+    if gnn_type_lower == 'gat':
+        gnn = GAT(
+            in_channels=1536,
+            hidden_channels=hidden_channels,
+            out_channels=1536,
+            num_layers=num_gnn_layers,
+            heads=4,
+        )
+    elif gnn_type_lower == 'gcn':
+        gnn = GCN(
+            in_channels=1536,
+            hidden_channels=hidden_channels,
+            out_channels=1536,
+            num_layers=num_gnn_layers,
+        )
+    elif gnn_type_lower == 'gin':
+        gnn = GIN(
+            in_channels=1536,
+            hidden_channels=hidden_channels,
+            out_channels=1536,
+            num_layers=num_gnn_layers,
+        )
+    else:
+        raise ValueError(f"Unsupported GNN type: {gnn_type}. Choose from 'gat', 'gcn', or 'gin'.")
 
     if llama_version == 'tiny_llama':
         llm = LLM(
@@ -758,6 +778,8 @@ if __name__ == '__main__':
                         help='Save all node importance scores from GNAN to JSON during final test evaluation.')
     parser.add_argument('--use_full_graph_context', action='store_true',
                         help='Use full graph in context without augmentation. Overrides PCST and GNAN augmentation flags.')
+    parser.add_argument('--gnn_type', type=str, default='gat', choices=['gat', 'gcn', 'gin'],
+                        help='Type of GNN to use: gat (Graph Attention Network), gcn (Graph Convolutional Network), or gin (Graph Isomorphism Network).')
     args = parser.parse_args()
     load_dotenv('db.env', override=True)
 
@@ -773,6 +795,7 @@ if __name__ == '__main__':
         retrieval_config_version=args.retrieval_config_version,
         algo_config_version=args.algo_config_version,
         g_retriever_config_version=args.g_retriever_config_version,
+        gnn_type=args.gnn_type,
         checkpointing=args.checkpointing,
         sys_prompt="help answer the user question as best as you can",
         num_gpus=1,
