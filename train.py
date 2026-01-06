@@ -296,9 +296,9 @@ def train(
         model_save_name = f'llm-{llama_version}'
     else:
         if args.freeze_llm:
-            model_save_name = f'gnn-frozen-llm-{llama_version}'
+            model_save_name = f'{gnn_type}-gnn-frozen-llm-{llama_version}'
         else:
-            model_save_name = f'gnn-llm-{llama_version}'
+            model_save_name = f'{gnn_type}-gnn-llm-{llama_version}'
 
     if model_save_name == f'llm-{llama_version}':
         root_path = f"stark_qa_vector_rag_{retrieval_config_version}"
