@@ -13,4 +13,8 @@ stark_qa_v0_0/
 
 *base_subgraphs/
 processed_chunks/
-*stark_qa*/
+*stark_qa*/# pixi environments
+.pixi/*
+!.pixi/config.toml
+*.pt
+*.tar.gz

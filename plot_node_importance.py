@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""
+Script to visualize node importance and subgraphs from a trained GNAN model.
+
+This script:
+1. Loads a trained GNAN model
+2. Selects examples from the test set
+3. Computes node importance scores using GNAN
+4. Visualizes the subgraphs with node importance highlighted
+
+Usage:
+    python plot_node_importance.py --algo_version 4 --num_examples 3
+    python plot_node_importance.py --algo_version 4 --specific_indices 0 5 10
+"""
+
+import argparse
+import io
+import os
+import sys
+from typing import List, Optional, Tuple
+
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
+import pandas as pd
+import torch
+from dotenv import load_dotenv
+from matplotlib.patches import Rectangle
+from stark_qa import load_qa
+from torch_geometric import seed_everything
+from torch_geometric.nn import GRetriever, TensorGNAN
+from torch_geometric.nn.nlp import LLM
+from torch_geometric.transforms.gnan import PreprocessDistances
+
+from STaRKQADatasetGDS import STaRKQADataset
+
+
+def load_params_dict(model, save_path):
+    """Load model parameters from a checkpoint file."""
+    state_dict = model.state_dict()
+    checkpoint = torch.load(save_path, map_location='cpu')
+    # Handle both full checkpoint and direct state dict formats
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        checkpoint = checkpoint['model_state_dict']
+    state_dict.update(checkpoint)
+    model.load_state_dict(state_dict)
+    return model
+
+
+def get_node_importance(model, data, device='cpu'):
+    """
+    Compute node importance scores using GNAN.
+    Returns importance scores for all nodes.
+    """
+    data = data.to(device)
+
+    with torch.no_grad():
+        contrib = model.gnn.node_importance(data)
+        scores = contrib.sum(dim=1)  # Sum over feature dimensions
+
+    return scores.cpu().numpy()
+
+
+def parse_node_info_from_desc(desc: str):
+    """
+    Parse node information from the description CSV format.
+    Returns a list of dicts with 'name' and 'description' for each node.
+    """
+    sep = '\nsrc,edge_attr,dst\n'
+    pos = desc.find(sep)
+    nodes_csv = desc[:pos] if pos != -1 else desc
+
+    try:
+        nodes_df = pd.read_csv(io.StringIO(nodes_csv))
+        if 'node_attr' in nodes_df.columns:
+            node_attr_series = nodes_df['node_attr'].astype(str)
+            names_series = node_attr_series.str.extract(r'^name:\s*(.*?),(?:\s*)description:\s*.*$')[0]
+            descs_series = node_attr_series.str.extract(r'^name:\s*.*?,(?:\s*)description:\s*(.*)$')[0]
+            names = names_series.fillna(node_attr_series).tolist()
+            descriptions = descs_series.fillna('').tolist()
+        else:
+            fallback_series = nodes_df[nodes_df.columns[-1]].astype(str)
+            names = fallback_series.tolist()
+            descriptions = ['' for _ in names]
+
+        return [{'name': n, 'description': d} for n, d in zip(names, descriptions)]
+    except Exception as e:
+        print(f"Warning: Could not parse node info: {e}")
+        return []
+
+
+def parse_edge_info_from_desc(desc: str):
+    """
+    Parse edge information from the description CSV format.
+    Returns edge list as tuples (src_idx, dst_idx, edge_attr).
+    """
+    sep = '\nsrc,edge_attr,dst\n'
+    pos = desc.find(sep)
+    if pos == -1:
+        return []
+
+    edges_csv = desc[pos + len(sep):]
+
+    try:
+        edges_df = pd.read_csv(io.StringIO('src,edge_attr,dst\n' + edges_csv))
+        edges = []
+        for _, row in edges_df.iterrows():
+            edges.append((int(row['src']), int(row['dst']), str(row['edge_attr'])))
+        return edges
+    except Exception as e:
+        print(f"Warning: Could not parse edge info: {e}")
+        return []
+
+
+def create_networkx_graph(data, node_info: List[dict], importance_scores: np.ndarray):
+    """
+    Create a NetworkX graph from PyG data with node importance scores.
+    """
+    G = nx.DiGraph()
+
+    # Add nodes with attributes
+    num_nodes = data.x.size(0)
+    for i in range(num_nodes):
+        node_name = node_info[i]['name'] if i < len(node_info) else f"Node {i}"
+        node_desc = node_info[i]['description'] if i < len(node_info) else ""
+
+        # Truncate long descriptions
+        if len(node_desc) > 100:
+            node_desc = node_desc[:100] + "..."
+
+        G.add_node(i,
+                   name=node_name,
+                   description=node_desc,
+                   importance=float(importance_scores[i]))
+
+    # Add edges
+    edge_index = data.edge_index.cpu().numpy()
+    for i in range(edge_index.shape[1]):
+        src, dst = edge_index[0, i], edge_index[1, i]
+        G.add_edge(int(src), int(dst))
+
+    return G
+
+
+def plot_subgraph_with_importance(
+    G: nx.DiGraph,
+    importance_scores: np.ndarray,
+    title: str,
+    top_k: int = 10,
+    figsize: Tuple[int, int] = (16, 12),
+    save_path: Optional[str] = None
+):
+    """
+    Plot a subgraph with node importance highlighted.
+
+    Args:
+        G: NetworkX graph
+        importance_scores: Node importance scores
+        title: Plot title
+        top_k: Number of top nodes to highlight
+        figsize: Figure size
+        save_path: Path to save the plot (optional)
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+
+    # Get top-k important nodes
+    top_k = min(top_k, len(importance_scores))
+    top_indices = np.argsort(importance_scores)[-top_k:][::-1]
+
+    # Normalize importance scores for color mapping
+    norm_scores = importance_scores.copy()
+    if norm_scores.max() > 0:
+        norm_scores = norm_scores / norm_scores.max()
+
+    # Create layout
+    pos = nx.spring_layout(G, k=2, iterations=50, seed=42)
+
+    # Plot 1: Full graph with importance coloring
+    ax1.set_title(f"{title}\nFull Subgraph (colored by importance)", fontsize=14, fontweight='bold')
+
+    # Draw edges
+    nx.draw_networkx_edges(G, pos, ax=ax1, alpha=0.3, arrows=True,
+                          arrowsize=10, edge_color='gray', width=1)
+
+    # Draw all nodes with importance coloring
+    node_colors = [norm_scores[i] for i in G.nodes()]
+    nx.draw_networkx_nodes(G, pos, ax=ax1, node_color=node_colors,
+                          cmap=plt.cm.YlOrRd, node_size=500,
+                          vmin=0, vmax=1, alpha=0.8)
+
+    # Draw labels for top-k nodes only
+    top_labels = {i: G.nodes[i]['name'][:20] for i in top_indices if i in G.nodes()}
+    nx.draw_networkx_labels(G, pos, labels=top_labels, ax=ax1,
+                           font_size=8, font_weight='bold')
+
+    ax1.axis('off')
+
+    # Add colorbar
+    sm = plt.cm.ScalarMappable(cmap=plt.cm.YlOrRd,
+                               norm=plt.Normalize(vmin=0, vmax=1))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax1, fraction=0.046, pad=0.04)
+    cbar.set_label('Node Importance', rotation=270, labelpad=20)
+
+    # Plot 2: Top-k subgraph
+    top_k_nodes = set(top_indices)
+    # Include neighbors of top-k nodes for context
+    extended_nodes = set(top_k_nodes)
+    for node in top_k_nodes:
+        if node in G:
+            extended_nodes.update(G.predecessors(node))
+            extended_nodes.update(G.successors(node))
+
+    # Limit extended nodes to prevent overcrowding
+    if len(extended_nodes) > top_k * 3:
+        # Sort by importance and take top nodes
+        extended_list = sorted(extended_nodes,
+                              key=lambda x: importance_scores[x],
+                              reverse=True)[:top_k * 3]
+        extended_nodes = set(extended_list)
+
+    G_sub = G.subgraph(extended_nodes).copy()
+    pos_sub = {k: pos[k] for k in G_sub.nodes()}
+
+    ax2.set_title(f"Top-{top_k} Important Nodes + Neighbors", fontsize=14, fontweight='bold')
+
+    # Draw edges in subgraph
+    nx.draw_networkx_edges(G_sub, pos_sub, ax=ax2, alpha=0.4, arrows=True,
+                          arrowsize=15, edge_color='gray', width=2)
+
+    # Draw nodes - different colors for top-k vs neighbors
+    top_k_in_sub = [n for n in G_sub.nodes() if n in top_k_nodes]
+    neighbor_nodes = [n for n in G_sub.nodes() if n not in top_k_nodes]
+
+    # Draw neighbor nodes (gray)
+    if neighbor_nodes:
+        nx.draw_networkx_nodes(G_sub, pos_sub, nodelist=neighbor_nodes,
+                              ax=ax2, node_color='lightgray',
+                              node_size=400, alpha=0.6)
+
+    # Draw top-k nodes (colored by importance)
+    if top_k_in_sub:
+        top_k_colors = [norm_scores[i] for i in top_k_in_sub]
+        nx.draw_networkx_nodes(G_sub, pos_sub, nodelist=top_k_in_sub,
+                              ax=ax2, node_color=top_k_colors,
+                              cmap=plt.cm.YlOrRd, node_size=800,
+                              vmin=0, vmax=1, alpha=1.0,
+                              edgecolors='black', linewidths=2)
+
+    # Draw all labels in subgraph
+    labels_sub = {i: G_sub.nodes[i]['name'][:20] for i in G_sub.nodes()}
+    nx.draw_networkx_labels(G_sub, pos_sub, labels=labels_sub, ax=ax2,
+                           font_size=9, font_weight='bold')
+
+    ax2.axis('off')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved plot to: {save_path}")
+
+    return fig
+
+
+def plot_importance_bar_chart(
+    importance_scores: np.ndarray,
+    node_info: List[dict],
+    title: str,
+    top_k: int = 20,
+    figsize: Tuple[int, int] = (12, 8),
+    save_path: Optional[str] = None
+):
+    """
+    Plot a bar chart of top-k node importance scores.
+    """
+    top_k = min(top_k, len(importance_scores))
+    top_indices = np.argsort(importance_scores)[-top_k:][::-1]
+    top_scores = importance_scores[top_indices]
+
+    # Get node names
+    node_names = []
+    for idx in top_indices:
+        if idx < len(node_info):
+            name = node_info[idx]['name']
+            if len(name) > 30:
+                name = name[:27] + "..."
+            node_names.append(f"{name} [{idx}]")
+        else:
+            node_names.append(f"Node {idx}")
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Create color gradient
+    colors = plt.cm.YlOrRd(np.linspace(0.4, 1.0, top_k))
+
+    # Create horizontal bar chart
+    y_pos = np.arange(top_k)
+    bars = ax.barh(y_pos, top_scores, color=colors, alpha=0.8, edgecolor='black')
+
+    # Customize
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(node_names, fontsize=9)
+    ax.invert_yaxis()  # Highest importance at top
+    ax.set_xlabel('Importance Score', fontsize=12, fontweight='bold')
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
+    ax.grid(axis='x', alpha=0.3, linestyle='--')
+
+    # Add value labels on bars
+    for i, (bar, score) in enumerate(zip(bars, top_scores)):
+        width = bar.get_width()
+        ax.text(width, bar.get_y() + bar.get_height()/2,
+               f' {score:.4f}',
+               ha='left', va='center', fontsize=8, fontweight='bold')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved bar chart to: {save_path}")
+
+    return fig
+
+
+def plot_example_analysis(
+    model,
+    data,
+    example_idx: int,
+    output_dir: str,
+    top_k: int = 10,
+    device='cpu'
+):
+    """
+    Complete analysis and plotting for a single example.
+    """
+    # Get node importance
+    importance_scores = get_node_importance(model, data, device)
+
+    # Parse node info
+    desc = data.desc if isinstance(data.desc, str) else data.desc[0]
+    node_info = parse_node_info_from_desc(desc)
+
+    # Get question and label
+    question = data.question if isinstance(data.question, str) else data.question[0]
+    label = data.label if isinstance(data.label, str) else data.label[0]
+
+    # Clean question for display
+    clean_question = question.replace('Question: ', '').replace('Answer: ', '').strip()
+    if len(clean_question) > 100:
+        clean_question = clean_question[:100] + "..."
+
+    print(f"\n{'='*80}")
+    print(f"Example {example_idx}")
+    print(f"{'='*80}")
+    print(f"Question: {clean_question}")
+    print(f"Answer: {label}")
+    print(f"Nodes: {data.x.size(0)}, Edges: {data.edge_index.size(1)}")
+
+    # Print top-k important nodes
+    top_k_actual = min(top_k, len(importance_scores))
+    top_indices = np.argsort(importance_scores)[-top_k_actual:][::-1]
+
+    print(f"\nTop-{top_k_actual} Important Nodes:")
+    print(f"{'-'*80}")
+    for rank, idx in enumerate(top_indices, 1):
+        score = importance_scores[idx]
+        if idx < len(node_info):
+            name = node_info[idx]['name']
+            desc_text = node_info[idx]['description']
+            if len(desc_text) > 80:
+                desc_text = desc_text[:80] + "..."
+            print(f"  {rank:2d}. [{idx:3d}] {name:40s} | Score: {score:.4f}")
+            if desc_text:
+                print(f"      {desc_text}")
+        else:
+            print(f"  {rank:2d}. [Node {idx}] Score: {score:.4f}")
+
+    # Create NetworkX graph
+    G = create_networkx_graph(data, node_info, importance_scores)
+
+    # Plot subgraph with importance
+    graph_title = f"Example {example_idx}: {clean_question}"
+    graph_save_path = os.path.join(output_dir, f"example_{example_idx}_subgraph.png")
+    plot_subgraph_with_importance(
+        G, importance_scores, graph_title,
+        top_k=top_k, save_path=graph_save_path
+    )
+    plt.close()
+
+    # Plot importance bar chart
+    bar_title = f"Example {example_idx}: Top-{top_k_actual} Node Importance"
+    bar_save_path = os.path.join(output_dir, f"example_{example_idx}_importance_bars.png")
+    plot_importance_bar_chart(
+        importance_scores, node_info, bar_title,
+        top_k=20, save_path=bar_save_path
+    )
+    plt.close()
+
+    # Create a summary text file
+    summary_path = os.path.join(output_dir, f"example_{example_idx}_summary.txt")
+    with open(summary_path, 'w') as f:
+        f.write(f"Example {example_idx} - Node Importance Analysis\n")
+        f.write(f"{'='*80}\n\n")
+        f.write(f"Question: {question}\n\n")
+        f.write(f"Answer: {label}\n\n")
+        f.write(f"Graph Statistics:\n")
+        f.write(f"  - Number of nodes: {data.x.size(0)}\n")
+        f.write(f"  - Number of edges: {data.edge_index.size(1)}\n")
+        f.write(f"  - Max importance score: {importance_scores.max():.4f}\n")
+        f.write(f"  - Min importance score: {importance_scores.min():.4f}\n")
+        f.write(f"  - Mean importance score: {importance_scores.mean():.4f}\n\n")
+
+        f.write(f"Top-{top_k_actual} Important Nodes:\n")
+        f.write(f"{'-'*80}\n")
+        for rank, idx in enumerate(top_indices, 1):
+            score = importance_scores[idx]
+            if idx < len(node_info):
+                name = node_info[idx]['name']
+                desc_text = node_info[idx]['description']
+                f.write(f"\n{rank:2d}. Node Index: {idx}\n")
+                f.write(f"    Name: {name}\n")
+                f.write(f"    Importance Score: {score:.4f}\n")
+                if desc_text:
+                    f.write(f"    Description: {desc_text}\n")
+            else:
+                f.write(f"\n{rank:2d}. Node {idx}: Score {score:.4f}\n")
+
+    print(f"\nSaved summary to: {summary_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Plot node importance and subgraphs from trained GNAN model.'
+    )
+    parser.add_argument('--algo_version', type=int, default=4,
+                       help='Algorithm config version (default: 4)')
+    parser.add_argument('--retrieval_version', type=int, default=0,
+                       help='Retrieval config version (default: 0)')
+    parser.add_argument('--g_retriever_version', type=int, default=0,
+                       help='G-Retriever config version (default: 0)')
+    parser.add_argument('--llama_version', type=str, default='llama3.1-8b',
+                       help='LLaMA version (default: llama3.1-8b)')
+    parser.add_argument('--num_examples', type=int, default=3,
+                       help='Number of examples to plot (default: 3)')
+    parser.add_argument('--specific_indices', type=int, nargs='+', default=None,
+                       help='Specific test set indices to plot (e.g., 0 5 10)')
+    parser.add_argument('--top_k', type=int, default=10,
+                       help='Number of top important nodes to highlight (default: 10)')
+    parser.add_argument('--output_dir', type=str, default=None,
+                       help='Output directory for plots (default: auto-generated)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed (default: 42)')
+    parser.add_argument('--model_path', type=str, default=None,
+                       help='Path to model checkpoint (default: auto-detected)')
+
+    args = parser.parse_args()
+
+    load_dotenv('db.env', override=True)
+    seed_everything(args.seed)
+
+    # Determine paths
+    root_path = f"stark_qa_v{args.retrieval_version}_{args.algo_version}"
+
+    if args.model_path is None:
+        # Auto-detect model path
+        model_name = f"{args.retrieval_version}_{args.algo_version}_{args.g_retriever_version}_gnn-llm-{args.llama_version}.pt"
+        model_path = os.path.join(root_path, 'models', model_name)
+
+        # Check for best val loss checkpoint
+        best_ckpt_name = f"{args.retrieval_version}_{args.algo_version}_{args.g_retriever_version}_gnn-llm-{args.llama_version}_best_val_loss_ckpt.pt"
+        best_ckpt_path = os.path.join(root_path, 'models', best_ckpt_name)
+        if os.path.exists(best_ckpt_path):
+            model_path = best_ckpt_path
+            print(f"Using best validation checkpoint: {model_path}")
+        else:
+            print(f"Using model: {model_path}")
+    else:
+        model_path = args.model_path
+        print(f"Using specified model: {model_path}")
+
+    if not os.path.exists(model_path):
+        print(f"Error: Model file not found: {model_path}")
+        print("\nAvailable models:")
+        models_dir = os.path.join(root_path, 'models')
+        if os.path.exists(models_dir):
+            for f in os.listdir(models_dir):
+                if f.endswith('.pt'):
+                    print(f"  - {f}")
+        else:
+            print(f"  Models directory not found: {models_dir}")
+        sys.exit(1)
+
+    # Setup output directory
+    if args.output_dir is None:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output_dir = os.path.join(
+            root_path, 'visualizations',
+            f'node_importance_algo{args.algo_version}_{timestamp}'
+        )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"\nOutput directory: {args.output_dir}")
+
+    # Load test dataset
+    print(f"\nLoading test dataset from {root_path}...")
+    qa_dataset = load_qa("prime")
+    qa_raw_test = qa_dataset.get_subset('test')
+    test_dataset = STaRKQADataset(
+        root_path, qa_raw_test,
+        args.retrieval_version, args.algo_version,
+        split="test",
+        transform=PreprocessDistances()
+    )
+    print(f"Loaded {len(test_dataset)} test examples")
+
+    # Create model architecture
+    print("\nInitializing model architecture...")
+    gnn = TensorGNAN(
+        in_channels=1536,
+        hidden_channels=1536,
+        out_channels=1536,
+        n_layers=4,
+        normalize_rho=True,
+        feature_groups=[list(range(1536))],
+    )
+
+    if args.llama_version == 'tiny_llama':
+        llm = LLM(
+            model_name='TinyLlama/TinyLlama-1.1B-Chat-v0.1',
+            num_params=1
+        )
+        model = GRetriever(llm=llm, gnn=gnn, mlp_out_channels=2048)
+    elif args.llama_version == 'llama2-7b':
+        llm = LLM(
+            model_name='meta-llama/Llama-2-7b-chat-hf',
+            num_params=7
+        )
+        model = GRetriever(llm=llm, gnn=gnn)
+    elif args.llama_version == 'llama3.1-8b':
+        llm = LLM(
+            model_name='meta-llama/Llama-3.1-8B-Instruct',
+            num_params=8
+        )
+        model = GRetriever(llm=llm, gnn=gnn)
+    else:
+        raise ValueError(f"Unknown llama_version: {args.llama_version}")
+
+    # Load model weights
+    print(f"Loading model weights from {model_path}...")
+    model = load_params_dict(model, model_path)
+    model.eval()
+    device = next(model.gnn.parameters()).device
+    print(f"Model loaded successfully on device: {device}")
+
+    # Determine which examples to plot
+    if args.specific_indices is not None:
+        indices_to_plot = args.specific_indices
+        print(f"\nPlotting specific indices: {indices_to_plot}")
+    else:
+        # Select random examples
+        max_idx = len(test_dataset)
+        np.random.seed(args.seed)
+        indices_to_plot = np.random.choice(max_idx,
+                                          size=min(args.num_examples, max_idx),
+                                          replace=False).tolist()
+        print(f"\nPlotting {len(indices_to_plot)} random examples: {indices_to_plot}")
+
+    # Plot each example
+    for idx in indices_to_plot:
+        if idx >= len(test_dataset):
+            print(f"\nWarning: Index {idx} is out of range (dataset has {len(test_dataset)} examples)")
+            continue
+
+        try:
+            data = test_dataset[idx]
+            plot_example_analysis(model, data, idx, args.output_dir,
+                                 top_k=args.top_k, device=device)
+        except Exception as e:
+            print(f"\nError plotting example {idx}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    print(f"\n{'='*80}")
+    print(f"All plots saved to: {args.output_dir}")
+    print(f"{'='*80}\n")
+
+
+if __name__ == '__main__':
+    main()
